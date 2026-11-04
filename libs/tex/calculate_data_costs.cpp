@@ -8,6 +8,10 @@
  */
 
 #include <numeric>
+#include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 #include <mve/image_color.h>
 #include <acc/bvh_tree.h>
@@ -353,6 +357,113 @@ postprocess_face_infos(Settings const & settings,
     std::cout << "\tClamping qualities to " << percentile << " within normalization." << std::endl;
 }
 
+/* PATCH4: a square of the forced views file. */
+struct ForcedSquare {
+    std::string label;
+    std::string image_name;
+    int view_id;
+    float xmin, ymin, xmax, ymax;
+};
+
+/**
+ * PATCH4: reads the forced views file, one square per line: label image_name xmin ymin xmax ymax
+ * (mesh coordinates, '#' starts a comment line). image_name is matched against the view's image file name,
+ * with or without the extension the undistorted image adds (282-01_x.JPG matches 282-01_x.JPG.tif).
+ */
+std::vector<ForcedSquare>
+read_forced_squares(std::string const & filename, std::vector<TextureView> const & texture_views) {
+    std::vector<ForcedSquare> squares;
+    std::ifstream in(filename.c_str());
+    if (!in.good()) {
+        std::cout << "\t[PATCH4] Cannot read the forced views file " << filename << std::endl;
+        return squares;
+    }
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream fields(line);
+        ForcedSquare square;
+        if (!(fields >> square.label >> square.image_name >> square.xmin >> square.ymin >> square.xmax >> square.ymax)) {
+            std::cout << "\t[PATCH4] Ignoring malformed line: " << line << std::endl;
+            continue;
+        }
+
+        square.view_id = -1;
+        std::string const prefix = square.image_name + ".";
+        for (std::size_t j = 0; j < texture_views.size(); ++j) {
+            std::string const & path = texture_views[j].get_image_file();
+            std::size_t const slash = path.find_last_of("/\\");
+            std::string const name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+            if (name == square.image_name || name.compare(0, prefix.size(), prefix) == 0) {
+                square.view_id = static_cast<int>(j);
+                break;
+            }
+        }
+        if (square.view_id < 0) {
+            std::cout << "\t[PATCH4] " << square.label << ": " << square.image_name
+                << " is not one of the views, left as is" << std::endl;
+            continue;
+        }
+        squares.push_back(square);
+    }
+    return squares;
+}
+
+/**
+ * PATCH4: a face whose centre lies inside a square keeps that square's view as its only candidate, if the view
+ * sees it, so neither the photometric outlier removal nor the view selection can choose another view there.
+ * Where squares overlap, the square whose centre is nearest to the face wins.
+ */
+void
+force_views(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & texture_views,
+    std::string const & filename, FaceProjectionInfos * face_projection_infos) {
+    std::vector<ForcedSquare> const squares = read_forced_squares(filename, texture_views);
+    if (squares.empty()) return;
+
+    std::vector<unsigned int> const & faces = mesh->get_faces();
+    std::vector<math::Vec3f> const & vertices = mesh->get_vertices();
+    std::vector<std::size_t> num_forced(squares.size(), 0);
+    std::vector<std::size_t> num_unseen(squares.size(), 0);
+
+    for (std::size_t i = 0; i < faces.size(); i += 3) {
+        math::Vec3f const center = (vertices[faces[i]] + vertices[faces[i + 1]] + vertices[faces[i + 2]]) / 3.0f;
+
+        int best = -1;
+        float best_distance = 0.0f;
+        for (std::size_t s = 0; s < squares.size(); ++s) {
+            ForcedSquare const & square = squares[s];
+            if (center[0] < square.xmin || center[0] > square.xmax || center[1] < square.ymin || center[1] > square.ymax)
+                continue;
+            float const dx = center[0] - (square.xmin + square.xmax) / 2.0f;
+            float const dy = center[1] - (square.ymin + square.ymax) / 2.0f;
+            float const distance = dx * dx + dy * dy;
+            if (best < 0 || distance < best_distance) {
+                best = static_cast<int>(s);
+                best_distance = distance;
+            }
+        }
+        if (best < 0) continue;
+
+        std::vector<FaceProjectionInfo> & infos = face_projection_infos->at(i / 3);
+        int const view_id = squares[best].view_id;
+        auto const it = std::find_if(infos.begin(), infos.end(),
+            [view_id](FaceProjectionInfo const & info) -> bool {return static_cast<int>(info.view_id) == view_id;});
+        if (it == infos.end()) {
+            num_unseen[best] += 1;
+            continue;
+        }
+        FaceProjectionInfo const forced = *it;
+        infos.assign(1, forced);
+        num_forced[best] += 1;
+    }
+
+    for (std::size_t s = 0; s < squares.size(); ++s) {
+        std::cout << "\t[PATCH4] " << squares[s].label << ": " << squares[s].image_name << " forced on "
+            << num_forced[s] << " faces, " << num_unseen[s] << " faces of the square not seen by it" << std::endl;
+    }
+}
+
 void
 calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> * texture_views,
     Settings const & settings, DataCosts * data_costs) {
@@ -367,6 +478,9 @@ calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> 
 
     FaceProjectionInfos face_projection_infos(num_faces);
     calculate_face_projection_infos(mesh, texture_views, settings, &face_projection_infos);
+    if (!settings.forced_views_file.empty()) {
+        force_views(mesh, *texture_views, settings.forced_views_file, &face_projection_infos);
+    }
     postprocess_face_infos(settings, &face_projection_infos, data_costs);
 }
 

@@ -20,6 +20,7 @@
 #define NADIR_MODE    "nadir_mode"
 #define NUM_THREADS "num_threads"
 #define MAX_TEXTURE_SIZE "max_texture_size"
+#define FORCED_VIEWS "forced_views"
 
 Arguments parse_args(int argc, char **argv) {
     util::Arguments args;
@@ -95,6 +96,9 @@ Arguments parse_args(int argc, char **argv) {
         "How many threads to use. Set 1 for determinism.");
     args.add_option('\0', MAX_TEXTURE_SIZE, true,
         "Maximum size of output textures.");
+    args.add_option('\0', FORCED_VIEWS, true,
+        "File with views forced on the faces inside given squares, one per line: "
+        "label image_name xmin ymin xmax ymax (mesh coordinates)");
     args.parse(argc, argv);
 
     Arguments conf;
@@ -158,6 +162,8 @@ Arguments parse_args(int argc, char **argv) {
                 conf.num_threads = std::stoi(i->arg);
             } else if (i->opt->lopt == MAX_TEXTURE_SIZE) {
                 conf.settings.max_texture_size = std::stoi(i->arg);
+            } else if (i->opt->lopt == FORCED_VIEWS) {
+                conf.settings.forced_views_file = i->arg;
             } else {
                 throw std::invalid_argument("Invalid long option");
             }
@@ -188,6 +194,7 @@ Arguments::to_string(){
         << "Output prefix: \t" << out_prefix << std::endl
         << "Datacost file: \t" << data_cost_file << std::endl
         << "Labeling file: \t" << labeling_file << std::endl
+        << "Forced views file: \t" << settings.forced_views_file << std::endl
         << "Data term: \t" << choice_string<tex::DataTerm>(settings.data_term) << std::endl
         << "Smoothness term: \t" << choice_string<tex::SmoothnessTerm>(settings.smoothness_term) << std::endl
         << "Outlier removal method: \t" << choice_string<tex::OutlierRemoval>(settings.outlier_removal) << std::endl

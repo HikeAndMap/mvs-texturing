@@ -89,6 +89,8 @@ class TextureView {
         int get_width(void) const;
         /** Returns the height of the corresponding image. */
         int get_height(void) const;
+        /** Returns the path of the corresponding image file. */
+        std::string const & get_image_file(void) const;
         /** Returns a reference pointer to the corresponding image. */
         template <typename T>
         typename mve::Image<T>::Ptr
@@ -157,6 +159,11 @@ TextureView::get_viewing_direction(void) const {
 inline int
 TextureView::get_width(void) const {
     return width;
+}
+
+inline std::string const &
+TextureView::get_image_file(void) const {
+    return image_file;
 }
 
 inline int

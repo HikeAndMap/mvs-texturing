@@ -95,6 +95,9 @@ struct Settings {
     bool nadir_mode = false;
 
     int max_texture_size = 8 * 1024;
+
+    /* PATCH4: file with the views forced on the faces inside given squares (empty: none). */
+    std::string forced_views_file;
 };
 
 TEX_NAMESPACE_END
