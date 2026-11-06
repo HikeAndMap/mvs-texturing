@@ -21,6 +21,8 @@
 #define NUM_THREADS "num_threads"
 #define MAX_TEXTURE_SIZE "max_texture_size"
 #define FORCED_VIEWS "forced_views"
+#define MASKED_BOXES "masked_boxes"
+#define MASKED_GROUND "masked_ground"
 
 Arguments parse_args(int argc, char **argv) {
     util::Arguments args;
@@ -99,6 +101,12 @@ Arguments parse_args(int argc, char **argv) {
     args.add_option('\0', FORCED_VIEWS, true,
         "File with views forced on the faces inside given squares, one per line: "
         "label image_name xmin ymin xmax ymax (mesh coordinates)");
+    args.add_option('\0', MASKED_BOXES, true,
+        "File with boxes per view, one per line: image_name x0 y0 x1 y1 (pixels; more fields are ignored). "
+        "A face is not painted from a view in which it touches a box, as long as a view without one sees it");
+    args.add_option('\0', MASKED_GROUND, true,
+        "File with wire masks per view and tile in mesh coordinates (ODX wire_masks.py). "
+        "A face is not painted from a view with a wire over it, as long as a view without one sees it");
     args.parse(argc, argv);
 
     Arguments conf;
@@ -164,6 +172,10 @@ Arguments parse_args(int argc, char **argv) {
                 conf.settings.max_texture_size = std::stoi(i->arg);
             } else if (i->opt->lopt == FORCED_VIEWS) {
                 conf.settings.forced_views_file = i->arg;
+            } else if (i->opt->lopt == MASKED_BOXES) {
+                conf.settings.masked_boxes_file = i->arg;
+            } else if (i->opt->lopt == MASKED_GROUND) {
+                conf.settings.masked_ground_file = i->arg;
             } else {
                 throw std::invalid_argument("Invalid long option");
             }
@@ -195,6 +207,8 @@ Arguments::to_string(){
         << "Datacost file: \t" << data_cost_file << std::endl
         << "Labeling file: \t" << labeling_file << std::endl
         << "Forced views file: \t" << settings.forced_views_file << std::endl
+        << "Masked boxes file: \t" << settings.masked_boxes_file << std::endl
+        << "Masked ground file: \t" << settings.masked_ground_file << std::endl
         << "Data term: \t" << choice_string<tex::DataTerm>(settings.data_term) << std::endl
         << "Smoothness term: \t" << choice_string<tex::SmoothnessTerm>(settings.smoothness_term) << std::endl
         << "Outlier removal method: \t" << choice_string<tex::OutlierRemoval>(settings.outlier_removal) << std::endl

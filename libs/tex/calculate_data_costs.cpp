@@ -9,6 +9,9 @@
 
 #include <numeric>
 #include <algorithm>
+#include <map>
+#include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -464,6 +467,335 @@ force_views(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & t
     }
 }
 
+/* PATCH7: a box of the masked boxes file, in pixels of the view's image. */
+struct MaskedBox {
+    float x0, y0, x1, y1;
+};
+
+/**
+ * PATCH7: reads the masked boxes file, one box per line: image_name x0 y0 x1 y1, more fields ignored ('#' starts a
+ * comment line). image_name is matched against the view's image file name as in read_forced_squares. Returns the boxes
+ * of every view (same index as texture_views).
+ */
+std::vector<std::vector<MaskedBox> >
+read_masked_boxes(std::string const & filename, std::vector<TextureView> const & texture_views) {
+    std::vector<std::vector<MaskedBox> > boxes(texture_views.size());
+    std::ifstream in(filename.c_str());
+    if (!in.good()) {
+        std::cout << "\t[PATCH7] Cannot read the masked boxes file " << filename << std::endl;
+        return boxes;
+    }
+
+    std::map<std::string, std::size_t> by_name;
+    for (std::size_t j = 0; j < texture_views.size(); ++j) {
+        std::string const & path = texture_views[j].get_image_file();
+        std::size_t const slash = path.find_last_of("/\\");
+        by_name[(slash == std::string::npos) ? path : path.substr(slash + 1)] = j;
+    }
+
+    std::size_t num_boxes = 0;
+    std::size_t num_unknown = 0;
+    std::string last_name;
+    long last_view = -1;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream fields(line);
+        std::string name;
+        MaskedBox box;
+        if (!(fields >> name >> box.x0 >> box.y0 >> box.x1 >> box.y1)) {
+            std::cout << "\t[PATCH7] Ignoring malformed line: " << line << std::endl;
+            continue;
+        }
+        if (name != last_name) {
+            last_name = name;
+            last_view = -1;
+            std::map<std::string, std::size_t>::const_iterator const it = by_name.find(name);
+            if (it != by_name.end()) {
+                last_view = static_cast<long>(it->second);
+            } else {
+                std::string const prefix = name + ".";
+                for (std::map<std::string, std::size_t>::const_iterator e = by_name.begin(); e != by_name.end(); ++e) {
+                    if (e->first.compare(0, prefix.size(), prefix) == 0) {
+                        last_view = static_cast<long>(e->second);
+                        break;
+                    }
+                }
+            }
+        }
+        if (last_view < 0) {
+            num_unknown += 1;
+            continue;
+        }
+        boxes[last_view].push_back(box);
+        num_boxes += 1;
+    }
+
+    std::size_t num_views = 0;
+    for (std::size_t j = 0; j < boxes.size(); ++j)
+        if (!boxes[j].empty()) num_views += 1;
+    std::cout << "\t[PATCH7] " << num_boxes << " boxes in " << num_views << " of " << texture_views.size() << " views";
+    if (num_unknown > 0) std::cout << " (" << num_unknown << " boxes of images that are not views, left out)";
+    std::cout << std::endl;
+    return boxes;
+}
+
+/**
+ * PATCH7: a view in which the face's projection touches a box is dropped as a candidate for that face, as long as at
+ * least one view without a box sees the face; a face that every view sees with a box keeps all its views (a vehicle
+ * parked during all flights stays). Runs after force_views: a forced face has one candidate, which is always kept.
+ */
+void
+mask_views(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & texture_views,
+    std::string const & filename, FaceProjectionInfos * face_projection_infos) {
+    std::vector<std::vector<MaskedBox> > const boxes = read_masked_boxes(filename, texture_views);
+
+    std::vector<unsigned int> const & faces = mesh->get_faces();
+    std::vector<math::Vec3f> const & vertices = mesh->get_vertices();
+    std::int64_t const num_faces = static_cast<std::int64_t>(face_projection_infos->size());
+
+    long long faces_cleared = 0;
+    long long faces_all_boxed = 0;
+    long long views_dropped = 0;
+
+    #pragma omp parallel for schedule(dynamic, 1024) reduction(+:faces_cleared,faces_all_boxed,views_dropped)
+    for (std::int64_t f = 0; f < num_faces; ++f) {
+        std::vector<FaceProjectionInfo> & infos = face_projection_infos->at(f);
+        if (infos.empty()) continue;
+
+        math::Vec3f const & v1 = vertices[faces[f * 3]];
+        math::Vec3f const & v2 = vertices[faces[f * 3 + 1]];
+        math::Vec3f const & v3 = vertices[faces[f * 3 + 2]];
+
+        std::vector<char> boxed(infos.size(), 0);
+        std::size_t num_boxed = 0;
+        for (std::size_t k = 0; k < infos.size(); ++k) {
+            std::vector<MaskedBox> const & view_boxes = boxes[infos[k].view_id];
+            if (view_boxes.empty()) continue;
+
+            TextureView const & view = texture_views[infos[k].view_id];
+            math::Vec2f const p1 = view.get_pixel_coords(v1);
+            math::Vec2f const p2 = view.get_pixel_coords(v2);
+            math::Vec2f const p3 = view.get_pixel_coords(v3);
+            float const xmin = std::min(p1[0], std::min(p2[0], p3[0]));
+            float const xmax = std::max(p1[0], std::max(p2[0], p3[0]));
+            float const ymin = std::min(p1[1], std::min(p2[1], p3[1]));
+            float const ymax = std::max(p1[1], std::max(p2[1], p3[1]));
+
+            for (std::size_t b = 0; b < view_boxes.size(); ++b) {
+                MaskedBox const & box = view_boxes[b];
+                if (xmax >= box.x0 && xmin <= box.x1 && ymax >= box.y0 && ymin <= box.y1) {
+                    boxed[k] = 1;
+                    num_boxed += 1;
+                    break;
+                }
+            }
+        }
+
+        if (num_boxed == 0) continue;
+        if (num_boxed == infos.size()) {
+            faces_all_boxed += 1;
+            continue;
+        }
+
+        std::vector<FaceProjectionInfo> kept;
+        kept.reserve(infos.size() - num_boxed);
+        for (std::size_t k = 0; k < infos.size(); ++k)
+            if (!boxed[k]) kept.push_back(infos[k]);
+        infos.swap(kept);
+        faces_cleared += 1;
+        views_dropped += static_cast<long long>(num_boxed);
+    }
+
+    std::cout << "\t[PATCH7] " << faces_cleared << " faces painted only from views without a vehicle or person on them ("
+        << views_dropped << " views left out), " << faces_all_boxed
+        << " faces with one in every view that sees them, left as they are" << std::endl;
+}
+
+/* PATCH8: overhead wire masks per view and tile, in mesh coordinates (written by ODX's wire_masks.py). */
+struct GroundMasks {
+    double x0, y0, tile, cell;
+    int nx, ny, n;
+    /* per tile (ty * nx + tx): (view index into texture_views, offset of its mask in bits), sorted by view */
+    std::vector<std::vector<std::pair<int, std::size_t> > > tiles;
+    std::vector<unsigned char> bits;
+};
+
+template <typename T>
+bool read_value(std::ifstream & in, T * value) {
+    in.read(reinterpret_cast<char *>(value), sizeof(T));
+    return static_cast<bool>(in);
+}
+
+/**
+ * PATCH8: reads the wire masks file: magic HAMWIRE1, x0 y0 tile cell (doubles), nx ny n (int32), the view names, then
+ * per mask: tile x, tile y, view (int32) and n * n bits (row 0 = north, numpy packbits order). Views are matched by
+ * image name as in read_forced_squares. Returns false if the file cannot be read.
+ */
+bool
+read_ground_masks(std::string const & filename, std::vector<TextureView> const & texture_views, GroundMasks * g) {
+    std::ifstream in(filename.c_str(), std::ios::binary);
+    char magic[8];
+    if (!in.good() || !in.read(magic, 8) || std::string(magic, 8) != "HAMWIRE1") {
+        std::cout << "\t[PATCH8] Cannot read the wire masks file " << filename << std::endl;
+        return false;
+    }
+    std::int32_t nx, ny, n, num_names;
+    if (!read_value(in, &g->x0) || !read_value(in, &g->y0) || !read_value(in, &g->tile) || !read_value(in, &g->cell)
+        || !read_value(in, &nx) || !read_value(in, &ny) || !read_value(in, &n) || !read_value(in, &num_names)) {
+        std::cout << "\t[PATCH8] The wire masks file is damaged: " << filename << std::endl;
+        return false;
+    }
+    g->nx = nx; g->ny = ny; g->n = n;
+
+    std::map<std::string, std::size_t> by_name;
+    for (std::size_t j = 0; j < texture_views.size(); ++j) {
+        std::string const & path = texture_views[j].get_image_file();
+        std::size_t const slash = path.find_last_of("/\\");
+        by_name[(slash == std::string::npos) ? path : path.substr(slash + 1)] = j;
+    }
+    std::vector<int> view_of(num_names, -1);
+    for (std::int32_t k = 0; k < num_names; ++k) {
+        std::uint16_t len;
+        if (!read_value(in, &len)) return false;
+        std::string name(len, ' ');
+        if (len > 0 && !in.read(&name[0], len)) return false;
+        std::map<std::string, std::size_t>::const_iterator const it = by_name.find(name);
+        if (it != by_name.end()) {
+            view_of[k] = static_cast<int>(it->second);
+        } else {
+            std::string const prefix = name + ".";
+            for (std::map<std::string, std::size_t>::const_iterator e = by_name.begin(); e != by_name.end(); ++e) {
+                if (e->first.compare(0, prefix.size(), prefix) == 0) {
+                    view_of[k] = static_cast<int>(e->second);
+                    break;
+                }
+            }
+        }
+    }
+
+    std::int64_t num_masks;
+    if (!read_value(in, &num_masks)) return false;
+    std::size_t const mask_bytes = (static_cast<std::size_t>(n) * n + 7) / 8;
+    g->tiles.assign(static_cast<std::size_t>(nx) * ny, std::vector<std::pair<int, std::size_t> >());
+    g->bits.resize(static_cast<std::size_t>(num_masks) * mask_bytes);
+    std::size_t used = 0, unknown = 0;
+    for (std::int64_t m = 0; m < num_masks; ++m) {
+        std::int32_t tx, ty, k;
+        if (!read_value(in, &tx) || !read_value(in, &ty) || !read_value(in, &k)) return false;
+        if (!in.read(reinterpret_cast<char *>(&g->bits[used * mask_bytes]), mask_bytes)) return false;
+        if (k < 0 || k >= num_names || view_of[k] < 0 || tx < 0 || ty < 0 || tx >= nx || ty >= ny) {
+            unknown += 1;
+            continue;
+        }
+        g->tiles[static_cast<std::size_t>(ty) * nx + tx].push_back(std::make_pair(view_of[k], used * mask_bytes));
+        used += 1;
+    }
+    g->bits.resize(used * mask_bytes);
+    for (std::size_t t = 0; t < g->tiles.size(); ++t)
+        std::sort(g->tiles[t].begin(), g->tiles[t].end());
+
+    std::cout << "\t[PATCH8] " << used << " wire masks read (" << nx << " x " << ny << " tiles of " << g->tile << " m)";
+    if (unknown > 0) std::cout << ", " << unknown << " of images that are not views left out";
+    std::cout << std::endl;
+    return true;
+}
+
+/**
+ * PATCH8: for each face, the views whose mask has a wire under the face, and the views not checked there, are dropped
+ * as candidates, as long as at least one view checked there has no wire under it; otherwise the face keeps its views.
+ * Runs after force_views and mask_views.
+ */
+void
+mask_ground(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & texture_views,
+    std::string const & filename, FaceProjectionInfos * face_projection_infos) {
+    GroundMasks g;
+    if (!read_ground_masks(filename, texture_views, &g)) return;
+
+    std::vector<unsigned int> const & faces = mesh->get_faces();
+    std::vector<math::Vec3f> const & vertices = mesh->get_vertices();
+    std::int64_t const num_faces = static_cast<std::int64_t>(face_projection_infos->size());
+    int const max_cells = 64;
+
+    long long faces_cleared = 0;
+    long long faces_without_clean = 0;
+    long long views_dropped = 0;
+
+    #pragma omp parallel for schedule(dynamic, 1024) reduction(+:faces_cleared,faces_without_clean,views_dropped)
+    for (std::int64_t f = 0; f < num_faces; ++f) {
+        std::vector<FaceProjectionInfo> & infos = face_projection_infos->at(f);
+        if (infos.empty()) continue;
+
+        math::Vec3f const & v1 = vertices[faces[f * 3]];
+        math::Vec3f const & v2 = vertices[faces[f * 3 + 1]];
+        math::Vec3f const & v3 = vertices[faces[f * 3 + 2]];
+        double const xmin = std::min(v1[0], std::min(v2[0], v3[0]));
+        double const xmax = std::max(v1[0], std::max(v2[0], v3[0]));
+        double const ymin = std::min(v1[1], std::min(v2[1], v3[1]));
+        double const ymax = std::max(v1[1], std::max(v2[1], v3[1]));
+        long gx0 = static_cast<long>(std::floor((xmin - g.x0) / g.cell));
+        long gx1 = static_cast<long>(std::floor((xmax - g.x0) / g.cell));
+        long gy0 = static_cast<long>(std::floor((ymin - g.y0) / g.cell));
+        long gy1 = static_cast<long>(std::floor((ymax - g.y0) / g.cell));
+        if (gx1 - gx0 >= max_cells) gx1 = gx0 + max_cells - 1;
+        if (gy1 - gy0 >= max_cells) gy1 = gy0 + max_cells - 1;
+        if (gx1 < 0 || gy1 < 0 || gx0 >= static_cast<long>(g.nx) * g.n || gy0 >= static_cast<long>(g.ny) * g.n) continue;
+
+        /* 0 clean, 1 wire, 2 not checked there */
+        std::vector<char> state(infos.size(), 0);
+        std::size_t num_clean = 0;
+        for (std::size_t k = 0; k < infos.size(); ++k) {
+            int const view = static_cast<int>(infos[k].view_id);
+            char st = 0;
+            long last_tile = -1;
+            std::size_t offset = 0;
+            bool have = false;
+            for (long gy = gy0; gy <= gy1 && st != 2; ++gy) {
+                for (long gx = gx0; gx <= gx1; ++gx) {
+                    if (gx < 0 || gy < 0 || gx >= static_cast<long>(g.nx) * g.n || gy >= static_cast<long>(g.ny) * g.n) { st = 2; break; }
+                    long const tx = gx / g.n, ty = gy / g.n;
+                    long const tile = ty * g.nx + tx;
+                    if (tile != last_tile) {
+                        last_tile = tile;
+                        std::vector<std::pair<int, std::size_t> > const & t = g.tiles[tile];
+                        std::vector<std::pair<int, std::size_t> >::const_iterator const it =
+                            std::lower_bound(t.begin(), t.end(), std::make_pair(view, static_cast<std::size_t>(0)));
+                        have = (it != t.end() && it->first == view);
+                        if (have) offset = it->second;
+                    }
+                    if (!have) { st = 2; break; }
+                    long const c = gx - tx * g.n;
+                    long const r = g.n - 1 - (gy - ty * g.n);
+                    std::size_t const bit = static_cast<std::size_t>(r) * g.n + static_cast<std::size_t>(c);
+                    if ((g.bits[offset + (bit >> 3)] >> (7 - (bit & 7))) & 1) st = 1;
+                }
+            }
+            state[k] = st;
+            if (st == 0) num_clean += 1;
+        }
+
+        if (num_clean == infos.size()) continue;
+        if (num_clean == 0) {
+            bool any_checked = false;
+            for (std::size_t k = 0; k < infos.size(); ++k) if (state[k] == 1) any_checked = true;
+            if (any_checked) faces_without_clean += 1;
+            continue;
+        }
+
+        std::vector<FaceProjectionInfo> kept;
+        kept.reserve(num_clean);
+        for (std::size_t k = 0; k < infos.size(); ++k)
+            if (state[k] == 0) kept.push_back(infos[k]);
+        views_dropped += static_cast<long long>(infos.size() - num_clean);
+        infos.swap(kept);
+        faces_cleared += 1;
+    }
+
+    std::cout << "\t[PATCH8] " << faces_cleared << " faces painted only from views without a wire over them ("
+        << views_dropped << " views left out), " << faces_without_clean
+        << " faces with a wire in every view checked there, left as they are" << std::endl;
+}
+
 void
 calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> * texture_views,
     Settings const & settings, DataCosts * data_costs) {
@@ -480,6 +812,12 @@ calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> 
     calculate_face_projection_infos(mesh, texture_views, settings, &face_projection_infos);
     if (!settings.forced_views_file.empty()) {
         force_views(mesh, *texture_views, settings.forced_views_file, &face_projection_infos);
+    }
+    if (!settings.masked_boxes_file.empty()) {
+        mask_views(mesh, *texture_views, settings.masked_boxes_file, &face_projection_infos);
+    }
+    if (!settings.masked_ground_file.empty()) {
+        mask_ground(mesh, *texture_views, settings.masked_ground_file, &face_projection_infos);
     }
     postprocess_face_infos(settings, &face_projection_infos, data_costs);
 }

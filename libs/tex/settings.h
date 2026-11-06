@@ -98,6 +98,14 @@ struct Settings {
 
     /* PATCH4: file with the views forced on the faces inside given squares (empty: none). */
     std::string forced_views_file;
+
+    /* PATCH7: file with boxes (vehicles, people) per view; a face is not painted from a view where it touches a box, as
+     * long as a view without one sees it (empty: none). */
+    std::string masked_boxes_file;
+
+    /* PATCH8: file with overhead wire masks per view and tile in mesh coordinates; a face is not painted from a view with
+     * a wire over it, as long as a view without one (and checked there) sees it (empty: none). */
+    std::string masked_ground_file;
 };
 
 TEX_NAMESPACE_END
