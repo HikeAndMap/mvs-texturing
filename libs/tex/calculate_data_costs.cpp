@@ -540,16 +540,34 @@ read_masked_boxes(std::string const & filename, std::vector<TextureView> const &
     return boxes;
 }
 
+/* PATCH7: whether the face (v1, v2, v3), projected into the view, touches one of the view's boxes. */
+bool
+face_touches_box(TextureView const & view, std::vector<MaskedBox> const & view_boxes,
+    math::Vec3f const & v1, math::Vec3f const & v2, math::Vec3f const & v3) {
+    if (view_boxes.empty()) return false;
+    math::Vec2f const p1 = view.get_pixel_coords(v1);
+    math::Vec2f const p2 = view.get_pixel_coords(v2);
+    math::Vec2f const p3 = view.get_pixel_coords(v3);
+    float const xmin = std::min(p1[0], std::min(p2[0], p3[0]));
+    float const xmax = std::max(p1[0], std::max(p2[0], p3[0]));
+    float const ymin = std::min(p1[1], std::min(p2[1], p3[1]));
+    float const ymax = std::max(p1[1], std::max(p2[1], p3[1]));
+    for (std::size_t b = 0; b < view_boxes.size(); ++b) {
+        MaskedBox const & box = view_boxes[b];
+        if (xmax >= box.x0 && xmin <= box.x1 && ymax >= box.y0 && ymin <= box.y1) return true;
+    }
+    return false;
+}
+
 /**
  * PATCH7: a view in which the face's projection touches a box is dropped as a candidate for that face, as long as at
  * least one view without a box sees the face; a face that every view sees with a box keeps all its views (a vehicle
- * parked during all flights stays). Runs after force_views: a forced face has one candidate, which is always kept.
+ * parked during all flights stays). Runs after force_views (a forced face has one candidate, which is always kept) and
+ * after prioritize_surveys (which already moved a face whose survey has a vehicle in every view to an older survey).
  */
 void
 mask_views(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & texture_views,
-    std::string const & filename, FaceProjectionInfos * face_projection_infos) {
-    std::vector<std::vector<MaskedBox> > const boxes = read_masked_boxes(filename, texture_views);
-
+    std::vector<std::vector<MaskedBox> > const & boxes, FaceProjectionInfos * face_projection_infos) {
     std::vector<unsigned int> const & faces = mesh->get_faces();
     std::vector<math::Vec3f> const & vertices = mesh->get_vertices();
     std::int64_t const num_faces = static_cast<std::int64_t>(face_projection_infos->size());
@@ -570,25 +588,9 @@ mask_views(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & te
         std::vector<char> boxed(infos.size(), 0);
         std::size_t num_boxed = 0;
         for (std::size_t k = 0; k < infos.size(); ++k) {
-            std::vector<MaskedBox> const & view_boxes = boxes[infos[k].view_id];
-            if (view_boxes.empty()) continue;
-
-            TextureView const & view = texture_views[infos[k].view_id];
-            math::Vec2f const p1 = view.get_pixel_coords(v1);
-            math::Vec2f const p2 = view.get_pixel_coords(v2);
-            math::Vec2f const p3 = view.get_pixel_coords(v3);
-            float const xmin = std::min(p1[0], std::min(p2[0], p3[0]));
-            float const xmax = std::max(p1[0], std::max(p2[0], p3[0]));
-            float const ymin = std::min(p1[1], std::min(p2[1], p3[1]));
-            float const ymax = std::max(p1[1], std::max(p2[1], p3[1]));
-
-            for (std::size_t b = 0; b < view_boxes.size(); ++b) {
-                MaskedBox const & box = view_boxes[b];
-                if (xmax >= box.x0 && xmin <= box.x1 && ymax >= box.y0 && ymin <= box.y1) {
-                    boxed[k] = 1;
-                    num_boxed += 1;
-                    break;
-                }
+            if (face_touches_box(texture_views[infos[k].view_id], boxes[infos[k].view_id], v1, v2, v3)) {
+                boxed[k] = 1;
+                num_boxed += 1;
             }
         }
 
@@ -796,6 +798,231 @@ mask_ground(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & t
         << " faces with a wire in every view checked there, left as they are" << std::endl;
 }
 
+/* PATCH10: the survey of every view (same index as texture_views). */
+struct ViewSurveys {
+    std::vector<int> rank;          /* 0 = the newest survey */
+    std::vector<char> reserve;      /* an older photo inside a newer survey */
+    std::vector<std::string> label; /* per rank, for the console */
+};
+
+/**
+ * PATCH10: reads the view surveys file (written by ODX's surveys.py), one view per line: image_name rank reserve [label]
+ * ('#' starts a comment line). image_name is matched against the view's image file name as in read_forced_squares. A view
+ * that is not in the file counts as the newest survey and not a reserve. Returns false when the file cannot be read or
+ * holds fewer than two surveys.
+ */
+bool
+read_view_surveys(std::string const & filename, std::vector<TextureView> const & texture_views, ViewSurveys * vs) {
+    std::ifstream in(filename.c_str());
+    if (!in.good()) {
+        std::cout << "\t[PATCH10] Cannot read the view surveys file " << filename << ", textured as one survey" << std::endl;
+        return false;
+    }
+
+    std::map<std::string, std::size_t> by_name;
+    for (std::size_t j = 0; j < texture_views.size(); ++j) {
+        std::string const & path = texture_views[j].get_image_file();
+        std::size_t const slash = path.find_last_of("/\\");
+        by_name[(slash == std::string::npos) ? path : path.substr(slash + 1)] = j;
+    }
+
+    vs->rank.assign(texture_views.size(), -1);
+    vs->reserve.assign(texture_views.size(), 0);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream fields(line);
+        std::string name, label;
+        int rank, reserve;
+        if (!(fields >> name >> rank >> reserve) || rank < 0) {
+            std::cout << "\t[PATCH10] Ignoring malformed line: " << line << std::endl;
+            continue;
+        }
+        fields >> label;
+        long view = -1;
+        std::map<std::string, std::size_t>::const_iterator const it = by_name.find(name);
+        if (it != by_name.end()) {
+            view = static_cast<long>(it->second);
+        } else {
+            std::string const prefix = name + ".";
+            for (std::map<std::string, std::size_t>::const_iterator e = by_name.begin(); e != by_name.end(); ++e) {
+                if (e->first.compare(0, prefix.size(), prefix) == 0) {
+                    view = static_cast<long>(e->second);
+                    break;
+                }
+            }
+        }
+        if (view < 0) continue;
+        vs->rank[view] = rank;
+        vs->reserve[view] = reserve ? 1 : 0;
+        if (static_cast<std::size_t>(rank) >= vs->label.size()) vs->label.resize(rank + 1);
+        if (!label.empty()) vs->label[rank] = label;
+    }
+
+    std::size_t unknown = 0;
+    for (std::size_t j = 0; j < vs->rank.size(); ++j) {
+        if (vs->rank[j] < 0) {
+            vs->rank[j] = 0;
+            unknown += 1;
+        }
+    }
+    if (vs->label.empty()) vs->label.resize(1);
+    for (std::size_t r = 0; r < vs->label.size(); ++r)
+        if (vs->label[r].empty()) vs->label[r] = "survey " + std::to_string(r + 1);
+    if (unknown > 0)
+        std::cout << "\t[PATCH10] " << unknown << " views are not in the view surveys file, counted as the newest survey" << std::endl;
+    if (vs->label.size() < 2) {
+        std::cout << "\t[PATCH10] One survey in the view surveys file, textured as usual" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+/**
+ * PATCH10: with photos of several surveys (months), each face is painted from one survey only, so that a building is never
+ * painted half from one year and half from another. The survey is the newest whose views (not counting reserve views) see
+ * the face within survey_max_angle of straight down; near the edge of a newer survey, where none of its views does, the
+ * survey of the most straight-down view takes over. Only that survey's views stay candidates. When every view of that
+ * survey has a vehicle or a person on the face (PATCH7 boxes), the newest other survey with a clean view within the angle
+ * paints it instead (reserve views included: the ground under a parked car is better than the car). Reserve views (older
+ * photos inside a newer survey) otherwise paint nothing; they keep their GCP squares through force_views, which runs
+ * before. A face seen only by reserve views keeps them. Runs after force_views and before mask_views and mask_ground,
+ * which then work inside the chosen survey (so wires never fall back to another survey).
+ */
+void
+prioritize_surveys(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & texture_views,
+    Settings const & settings, std::vector<std::vector<MaskedBox> > const & boxes,
+    FaceProjectionInfos * face_projection_infos) {
+    ViewSurveys vs;
+    if (!read_view_surveys(settings.view_surveys_file, texture_views, &vs)) return;
+
+    std::vector<unsigned int> const & faces = mesh->get_faces();
+    std::vector<math::Vec3f> const & vertices = mesh->get_vertices();
+    std::int64_t const num_faces = static_cast<std::int64_t>(face_projection_infos->size());
+    int const num_ranks = static_cast<int>(vs.label.size());
+    float const cos_max = std::cos(MATH_DEG2RAD(settings.survey_max_angle));
+    bool const have_boxes = !boxes.empty();
+
+    std::vector<long long> by_rank(num_ranks, 0);
+    long long edge_older = 0, vehicle_older = 0, reserve_only = 0, restricted = 0;
+
+    #pragma omp parallel
+    {
+        std::vector<long long> local_by_rank(num_ranks, 0);
+        long long local_edge = 0, local_vehicle = 0, local_reserve_only = 0, local_restricted = 0;
+
+        #pragma omp for schedule(dynamic, 1024)
+        for (std::int64_t f = 0; f < num_faces; ++f) {
+            std::vector<FaceProjectionInfo> & infos = face_projection_infos->at(f);
+            if (infos.empty()) continue;
+            if (infos.size() == 1) {
+                /* a GCP square, or a face only one view sees */
+                local_by_rank[std::min(num_ranks - 1, vs.rank[infos[0].view_id])] += 1;
+                continue;
+            }
+
+            math::Vec3f const & v1 = vertices[faces[f * 3]];
+            math::Vec3f const & v2 = vertices[faces[f * 3 + 1]];
+            math::Vec3f const & v3 = vertices[faces[f * 3 + 2]];
+            math::Vec3f const center = (v1 + v2 + v3) / 3.0f;
+
+            std::size_t const n = infos.size();
+            std::vector<int> rank(n);
+            std::vector<char> reserve(n), within(n);
+            std::vector<float> up(n);
+            int newest_seen = num_ranks;    /* newest survey seeing the face within the angle (reserve views not counted) */
+            int newest_any = num_ranks;     /* newest survey seeing it at all (reserve views not counted) */
+            int most_vertical = -1;         /* the non-reserve view looking most straight down at it */
+            for (std::size_t k = 0; k < n; ++k) {
+                int const view = static_cast<int>(infos[k].view_id);
+                rank[k] = std::min(num_ranks - 1, vs.rank[view]);
+                reserve[k] = vs.reserve[view];
+                up[k] = (texture_views[view].get_pos() - center).normalized()[2];
+                within[k] = up[k] >= cos_max ? 1 : 0;
+                if (reserve[k]) continue;
+                newest_any = std::min(newest_any, rank[k]);
+                if (within[k]) newest_seen = std::min(newest_seen, rank[k]);
+                if (most_vertical < 0 || up[k] > up[most_vertical]) most_vertical = static_cast<int>(k);
+            }
+            if (most_vertical < 0) {
+                local_reserve_only += 1;
+                continue;
+            }
+
+            int chosen = newest_seen;
+            if (chosen == num_ranks) {
+                chosen = rank[most_vertical];
+                if (chosen > newest_any) local_edge += 1;
+            }
+
+            std::vector<char> keep(n, 0);
+            std::size_t num_keep = 0;
+            bool fallback = false;
+            if (have_boxes) {
+                std::vector<char> boxed(n, 0);
+                bool chosen_clean = false;
+                for (std::size_t k = 0; k < n; ++k) {
+                    if (rank[k] != chosen && !within[k]) continue;
+                    int const view = static_cast<int>(infos[k].view_id);
+                    boxed[k] = face_touches_box(texture_views[view], boxes[view], v1, v2, v3) ? 1 : 0;
+                    if (rank[k] == chosen && !reserve[k] && !boxed[k]) chosen_clean = true;
+                }
+                if (!chosen_clean) {
+                    int other = num_ranks;
+                    for (std::size_t k = 0; k < n; ++k)
+                        if (rank[k] != chosen && within[k] && !boxed[k]) other = std::min(other, rank[k]);
+                    if (other < num_ranks) {
+                        for (std::size_t k = 0; k < n; ++k) {
+                            if (rank[k] == other && within[k] && !boxed[k]) {
+                                keep[k] = 1;
+                                num_keep += 1;
+                            }
+                        }
+                        chosen = other;
+                        fallback = true;
+                        local_vehicle += 1;
+                    }
+                }
+            }
+            if (!fallback) {
+                for (std::size_t k = 0; k < n; ++k) {
+                    if (rank[k] == chosen && !reserve[k]) {
+                        keep[k] = 1;
+                        num_keep += 1;
+                    }
+                }
+            }
+
+            local_by_rank[chosen] += 1;
+            if (num_keep == n || num_keep == 0) continue;
+            std::vector<FaceProjectionInfo> kept;
+            kept.reserve(num_keep);
+            for (std::size_t k = 0; k < n; ++k)
+                if (keep[k]) kept.push_back(infos[k]);
+            infos.swap(kept);
+            local_restricted += 1;
+        }
+
+        #pragma omp critical
+        {
+            for (int r = 0; r < num_ranks; ++r) by_rank[r] += local_by_rank[r];
+            edge_older += local_edge;
+            vehicle_older += local_vehicle;
+            reserve_only += local_reserve_only;
+            restricted += local_restricted;
+        }
+    }
+
+    std::cout << "\t[PATCH10] Faces by survey:";
+    for (int r = 0; r < num_ranks; ++r)
+        std::cout << (r ? ", " : " ") << vs.label[r] << (r == 0 ? " (newest) " : " ") << by_rank[r];
+    std::cout << std::endl;
+    std::cout << "\t[PATCH10] " << restricted << " faces painted from one survey only; " << edge_older
+        << " near the edge of a newer survey painted from an older one (no newer view within " << settings.survey_max_angle
+        << " deg); " << vehicle_older << " under a vehicle or person painted from an older survey; " << reserve_only
+        << " seen only by reserve views, left as they are" << std::endl;
+}
+
 void
 calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> * texture_views,
     Settings const & settings, DataCosts * data_costs) {
@@ -813,8 +1040,15 @@ calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> 
     if (!settings.forced_views_file.empty()) {
         force_views(mesh, *texture_views, settings.forced_views_file, &face_projection_infos);
     }
+    std::vector<std::vector<MaskedBox> > boxes;
     if (!settings.masked_boxes_file.empty()) {
-        mask_views(mesh, *texture_views, settings.masked_boxes_file, &face_projection_infos);
+        boxes = read_masked_boxes(settings.masked_boxes_file, *texture_views);
+    }
+    if (!settings.view_surveys_file.empty()) {
+        prioritize_surveys(mesh, *texture_views, settings, boxes, &face_projection_infos);
+    }
+    if (!boxes.empty()) {
+        mask_views(mesh, *texture_views, boxes, &face_projection_infos);
     }
     if (!settings.masked_ground_file.empty()) {
         mask_ground(mesh, *texture_views, settings.masked_ground_file, &face_projection_infos);

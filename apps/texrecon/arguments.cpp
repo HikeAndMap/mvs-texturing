@@ -23,6 +23,9 @@
 #define FORCED_VIEWS "forced_views"
 #define MASKED_BOXES "masked_boxes"
 #define MASKED_GROUND "masked_ground"
+#define VIEW_SURVEYS "view_surveys"
+#define SURVEY_MAX_ANGLE "survey_max_angle"
+#define WRITE_LABELING "write_labeling"
 
 Arguments parse_args(int argc, char **argv) {
     util::Arguments args;
@@ -107,6 +110,14 @@ Arguments parse_args(int argc, char **argv) {
     args.add_option('\0', MASKED_GROUND, true,
         "File with wire masks per view and tile in mesh coordinates (ODX wire_masks.py). "
         "A face is not painted from a view with a wire over it, as long as a view without one sees it");
+    args.add_option('\0', VIEW_SURVEYS, true,
+        "File with the survey of every view, one per line: image_name rank reserve (rank 0 = the newest survey; reserve 1 = "
+        "an older photo inside a newer survey). A face is painted from the newest survey that sees it within the survey "
+        "angle; a reserve view only paints GCP squares and the ground under vehicles");
+    args.add_option('\0', SURVEY_MAX_ANGLE, true,
+        "Angle from straight down within which a survey's view counts as seeing a face [25]");
+    args.add_option('\0', WRITE_LABELING, false,
+        "Write the labeling (the view of every face) and the view names, also with no_intermediate_results");
     args.parse(argc, argv);
 
     Arguments conf;
@@ -120,6 +131,7 @@ Arguments parse_args(int argc, char **argv) {
 
     conf.write_timings = false;
     conf.write_intermediate_results = true;
+    conf.write_labeling = false;
     conf.write_view_selection_model = false;
 
     conf.num_threads = -1;
@@ -176,6 +188,12 @@ Arguments parse_args(int argc, char **argv) {
                 conf.settings.masked_boxes_file = i->arg;
             } else if (i->opt->lopt == MASKED_GROUND) {
                 conf.settings.masked_ground_file = i->arg;
+            } else if (i->opt->lopt == VIEW_SURVEYS) {
+                conf.settings.view_surveys_file = i->arg;
+            } else if (i->opt->lopt == SURVEY_MAX_ANGLE) {
+                conf.settings.survey_max_angle = std::stof(i->arg);
+            } else if (i->opt->lopt == WRITE_LABELING) {
+                conf.write_labeling = true;
             } else {
                 throw std::invalid_argument("Invalid long option");
             }
@@ -209,6 +227,8 @@ Arguments::to_string(){
         << "Forced views file: \t" << settings.forced_views_file << std::endl
         << "Masked boxes file: \t" << settings.masked_boxes_file << std::endl
         << "Masked ground file: \t" << settings.masked_ground_file << std::endl
+        << "View surveys file: \t" << settings.view_surveys_file << std::endl
+        << "Survey max angle: \t" << settings.survey_max_angle << std::endl
         << "Data term: \t" << choice_string<tex::DataTerm>(settings.data_term) << std::endl
         << "Smoothness term: \t" << choice_string<tex::SmoothnessTerm>(settings.smoothness_term) << std::endl
         << "Outlier removal method: \t" << choice_string<tex::OutlierRemoval>(settings.outlier_removal) << std::endl

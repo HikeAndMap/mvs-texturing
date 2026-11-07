@@ -106,6 +106,13 @@ struct Settings {
     /* PATCH8: file with overhead wire masks per view and tile in mesh coordinates; a face is not painted from a view with
      * a wire over it, as long as a view without one (and checked there) sees it (empty: none). */
     std::string masked_ground_file;
+
+    /* PATCH10: file with the survey of every view (rank 0 = the newest) and whether the view is a reserve view (an older
+     * photo inside a newer survey: it paints only GCP squares and the ground under vehicles). Empty: one survey, as before. */
+    std::string view_surveys_file;
+
+    /* PATCH10: a survey paints a face when one of its views sees the face within this angle from straight down. */
+    float survey_max_angle = 25.0f;
 };
 
 TEX_NAMESPACE_END

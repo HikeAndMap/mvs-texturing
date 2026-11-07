@@ -10,6 +10,7 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <cstdint>
 #include <tbb/task_arena.h>
 #include <omp.h>
 
@@ -122,12 +123,38 @@ int main(int argc, char **argv) {
         std::cout << "\tTook: " << rwtimer.get_elapsed_sec() << "s" << std::endl;
 
         /* Write labeling to file. */
-        if (conf.write_intermediate_results) {
+        if (conf.write_intermediate_results || conf.write_labeling) {
             std::vector<std::size_t> labeling(graph.num_nodes());
             for (std::size_t i = 0; i < graph.num_nodes(); ++i) {
                 labeling[i] = graph.get_label(i);
             }
             vector_to_file(conf.out_prefix + "_labeling.vec", labeling);
+        }
+        /* PATCH10: label k is view k - 1 (0 = none); the views' images, one per line, and every face's triangle (x, y of its
+         * three corners, float32) with its label (uint32) after the magic HAMLAB01 and the face count (int64), so that ODX can
+         * map which photo painted where (prepare_mesh may have removed faces, so the mesh file's face order does not do). */
+        if (conf.write_labeling) {
+            std::ofstream views_out((conf.out_prefix + "_labeling_views.txt").c_str());
+            for (std::size_t j = 0; j < texture_views.size(); ++j)
+                views_out << texture_views[j].get_image_file() << "\n";
+
+            std::vector<unsigned int> const & mesh_faces = mesh->get_faces();
+            std::vector<math::Vec3f> const & mesh_vertices = mesh->get_vertices();
+            std::ofstream faces_out((conf.out_prefix + "_labeling_faces.bin").c_str(), std::ios::binary);
+            std::int64_t const num_written = static_cast<std::int64_t>(graph.num_nodes());
+            faces_out.write("HAMLAB01", 8);
+            faces_out.write(reinterpret_cast<char const *>(&num_written), sizeof(num_written));
+            for (std::size_t i = 0; i < graph.num_nodes(); ++i) {
+                float xy[6];
+                for (int c = 0; c < 3; ++c) {
+                    math::Vec3f const & v = mesh_vertices[mesh_faces[i * 3 + c]];
+                    xy[c * 2] = v[0];
+                    xy[c * 2 + 1] = v[1];
+                }
+                std::uint32_t const label = static_cast<std::uint32_t>(graph.get_label(i));
+                faces_out.write(reinterpret_cast<char const *>(xy), sizeof(xy));
+                faces_out.write(reinterpret_cast<char const *>(&label), sizeof(label));
+            }
         }
     } else {
         std::cout << "Loading labeling from file... " << std::flush;

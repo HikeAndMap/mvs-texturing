@@ -26,6 +26,8 @@ struct Arguments {
 
     bool write_timings;
     bool write_intermediate_results;
+    /* PATCH10: write the labeling (the view of every face) and its view names even without the other intermediate results. */
+    bool write_labeling;
     bool write_view_selection_model;
 
     int num_threads;
