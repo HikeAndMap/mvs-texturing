@@ -635,7 +635,8 @@ bool read_value(std::ifstream & in, T * value) {
  * image name as in read_forced_squares. Returns false if the file cannot be read.
  */
 bool
-read_ground_masks(std::string const & filename, std::vector<TextureView> const & texture_views, GroundMasks * g) {
+read_ground_masks(std::string const & filename, std::vector<TextureView> const & texture_views, GroundMasks * g,
+    bool quiet = false) {
     std::ifstream in(filename.c_str(), std::ios::binary);
     char magic[8];
     if (!in.good() || !in.read(magic, 8) || std::string(magic, 8) != "HAMWIRE1") {
@@ -697,6 +698,7 @@ read_ground_masks(std::string const & filename, std::vector<TextureView> const &
     for (std::size_t t = 0; t < g->tiles.size(); ++t)
         std::sort(g->tiles[t].begin(), g->tiles[t].end());
 
+    if (quiet) return true;
     std::cout << "\t[PATCH8] " << used << " wire masks read (" << nx << " x " << ny << " tiles of " << g->tile << " m)";
     if (unknown > 0) std::cout << ", " << unknown << " of images that are not views left out";
     std::cout << std::endl;
@@ -705,8 +707,9 @@ read_ground_masks(std::string const & filename, std::vector<TextureView> const &
 
 /**
  * PATCH8: for each face, the views whose mask has a wire under the face, and the views not checked there, are dropped
- * as candidates, as long as at least one view checked there has no wire under it; otherwise the face keeps its views.
- * Runs after force_views and mask_views.
+ * as candidates, as long as at least one view checked there has no wire under it. Otherwise (a wire in every view checked
+ * there, which split_wire_faces keeps to faces at its smallest size) only the checked views with the fewest wire cells
+ * under the face stay; a face no view was checked on keeps its views. Runs after force_views and mask_views.
  */
 void
 mask_ground(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & texture_views,
@@ -743,12 +746,14 @@ mask_ground(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & t
         if (gy1 - gy0 >= max_cells) gy1 = gy0 + max_cells - 1;
         if (gx1 < 0 || gy1 < 0 || gx0 >= static_cast<long>(g.nx) * g.n || gy0 >= static_cast<long>(g.ny) * g.n) continue;
 
-        /* 0 clean, 1 wire, 2 not checked there */
+        /* 0 clean, 1 wire, 2 not checked there; and the wire cells under the face */
         std::vector<char> state(infos.size(), 0);
+        std::vector<int> wire_cells(infos.size(), 0);
         std::size_t num_clean = 0;
         for (std::size_t k = 0; k < infos.size(); ++k) {
             int const view = static_cast<int>(infos[k].view_id);
             char st = 0;
+            int cells = 0;
             long last_tile = -1;
             std::size_t offset = 0;
             bool have = false;
@@ -769,18 +774,31 @@ mask_ground(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & t
                     long const c = gx - tx * g.n;
                     long const r = g.n - 1 - (gy - ty * g.n);
                     std::size_t const bit = static_cast<std::size_t>(r) * g.n + static_cast<std::size_t>(c);
-                    if ((g.bits[offset + (bit >> 3)] >> (7 - (bit & 7))) & 1) st = 1;
+                    if ((g.bits[offset + (bit >> 3)] >> (7 - (bit & 7))) & 1) {
+                        st = 1;
+                        cells += 1;
+                    }
                 }
             }
             state[k] = st;
+            wire_cells[k] = cells;
             if (st == 0) num_clean += 1;
         }
 
         if (num_clean == infos.size()) continue;
         if (num_clean == 0) {
-            bool any_checked = false;
-            for (std::size_t k = 0; k < infos.size(); ++k) if (state[k] == 1) any_checked = true;
-            if (any_checked) faces_without_clean += 1;
+            /* a wire in every view checked there (what is left after split_wire_faces): the views with the fewest wire
+             * cells under the face, so that it is painted from the least wire there is */
+            int fewest = -1;
+            for (std::size_t k = 0; k < infos.size(); ++k)
+                if (state[k] == 1 && (fewest < 0 || wire_cells[k] < fewest)) fewest = wire_cells[k];
+            if (fewest < 0) continue;
+            faces_without_clean += 1;
+            std::vector<FaceProjectionInfo> kept;
+            for (std::size_t k = 0; k < infos.size(); ++k)
+                if (state[k] == 1 && wire_cells[k] == fewest) kept.push_back(infos[k]);
+            views_dropped += static_cast<long long>(infos.size() - kept.size());
+            infos.swap(kept);
             continue;
         }
 
@@ -795,7 +813,8 @@ mask_ground(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & t
 
     std::cout << "\t[PATCH8] " << faces_cleared << " faces painted only from views without a wire over them ("
         << views_dropped << " views left out), " << faces_without_clean
-        << " faces with a wire in every view checked there, left as they are" << std::endl;
+        << " faces with a wire in every view checked there, painted from the views with the fewest wire cells under them"
+        << std::endl;
 }
 
 /* PATCH10: the survey of every view (same index as texture_views). */
@@ -812,10 +831,11 @@ struct ViewSurveys {
  * holds fewer than two surveys.
  */
 bool
-read_view_surveys(std::string const & filename, std::vector<TextureView> const & texture_views, ViewSurveys * vs) {
+read_view_surveys(std::string const & filename, std::vector<TextureView> const & texture_views, ViewSurveys * vs,
+    bool quiet = false) {
     std::ifstream in(filename.c_str());
     if (!in.good()) {
-        std::cout << "\t[PATCH10] Cannot read the view surveys file " << filename << ", textured as one survey" << std::endl;
+        if (!quiet) std::cout << "\t[PATCH10] Cannot read the view surveys file " << filename << ", textured as one survey" << std::endl;
         return false;
     }
 
@@ -835,7 +855,7 @@ read_view_surveys(std::string const & filename, std::vector<TextureView> const &
         std::string name, label;
         int rank, reserve;
         if (!(fields >> name >> rank >> reserve) || rank < 0) {
-            std::cout << "\t[PATCH10] Ignoring malformed line: " << line << std::endl;
+            if (!quiet) std::cout << "\t[PATCH10] Ignoring malformed line: " << line << std::endl;
             continue;
         }
         fields >> label;
@@ -869,13 +889,269 @@ read_view_surveys(std::string const & filename, std::vector<TextureView> const &
     if (vs->label.empty()) vs->label.resize(1);
     for (std::size_t r = 0; r < vs->label.size(); ++r)
         if (vs->label[r].empty()) vs->label[r] = "survey " + std::to_string(r + 1);
-    if (unknown > 0)
+    if (unknown > 0 && !quiet)
         std::cout << "\t[PATCH10] " << unknown << " views are not in the view surveys file, counted as the newest survey" << std::endl;
     if (vs->label.size() < 2) {
-        std::cout << "\t[PATCH10] One survey in the view surveys file, textured as usual" << std::endl;
+        if (!quiet) std::cout << "\t[PATCH10] One survey in the view surveys file, textured as usual" << std::endl;
         return false;
     }
     return true;
+}
+
+/**
+ * PATCH8: whether a face (corners a, b, c) has a wire under it in every view checked there. The views checked there are
+ * those with a mask on every tile under the face's bounding box (they see those tiles whole within 25 deg of straight
+ * down); with several surveys (vs not null), only those of the newest survey among them, not counting reserve views,
+ * since prioritize_surveys paints the face from that survey. False when no view was checked there, or one is clean.
+ */
+static bool
+wire_in_every_view(GroundMasks const & g, ViewSurveys const * vs, math::Vec3f const & a, math::Vec3f const & b,
+    math::Vec3f const & c) {
+    double const xmin = std::min(a[0], std::min(b[0], c[0]));
+    double const xmax = std::max(a[0], std::max(b[0], c[0]));
+    double const ymin = std::min(a[1], std::min(b[1], c[1]));
+    double const ymax = std::max(a[1], std::max(b[1], c[1]));
+    long const gx0 = static_cast<long>(std::floor((xmin - g.x0) / g.cell));
+    long gx1 = static_cast<long>(std::floor((xmax - g.x0) / g.cell));
+    long const gy0 = static_cast<long>(std::floor((ymin - g.y0) / g.cell));
+    long gy1 = static_cast<long>(std::floor((ymax - g.y0) / g.cell));
+    long const width = static_cast<long>(g.nx) * g.n, height = static_cast<long>(g.ny) * g.n;
+    if (gx0 < 0 || gy0 < 0 || gx1 >= width || gy1 >= height) return false;
+    int const max_cells = 64;
+    if (gx1 - gx0 >= max_cells) gx1 = gx0 + max_cells - 1;
+    if (gy1 - gy0 >= max_cells) gy1 = gy0 + max_cells - 1;
+
+    long const tx0 = gx0 / g.n, tx1 = gx1 / g.n, ty0 = gy0 / g.n, ty1 = gy1 / g.n;
+    std::vector<std::pair<int, std::size_t> > const & first = g.tiles[ty0 * g.nx + tx0];
+    if (first.empty()) return false;
+
+    /* the views with a mask on every tile under the face, and the bit offset of each of those masks */
+    struct Checked { int view; std::size_t offset[4]; };
+    std::vector<Checked> checked;
+    checked.reserve(first.size());
+    for (std::size_t i = 0; i < first.size(); ++i) {
+        Checked ch;
+        ch.view = first[i].first;
+        bool all = true;
+        int slot = 0;
+        for (long ty = ty0; ty <= ty1 && all; ++ty) {
+            for (long tx = tx0; tx <= tx1; ++tx, ++slot) {
+                if (slot >= 4) { all = false; break; }
+                std::vector<std::pair<int, std::size_t> > const & t = g.tiles[ty * g.nx + tx];
+                std::vector<std::pair<int, std::size_t> >::const_iterator const it =
+                    std::lower_bound(t.begin(), t.end(), std::make_pair(ch.view, static_cast<std::size_t>(0)));
+                if (it == t.end() || it->first != ch.view) { all = false; break; }
+                ch.offset[slot] = it->second;
+            }
+        }
+        if (all) checked.push_back(ch);
+    }
+    if (checked.empty()) return false;
+
+    int newest = -1;
+    if (vs != nullptr) {
+        for (std::size_t i = 0; i < checked.size(); ++i) {
+            int const v = checked[i].view;
+            if (!vs->reserve[v] && (newest < 0 || vs->rank[v] < newest)) newest = vs->rank[v];
+        }
+    }
+
+    bool any_wire = false;
+    for (std::size_t i = 0; i < checked.size(); ++i) {
+        int const v = checked[i].view;
+        if (newest >= 0 && (vs->rank[v] != newest || vs->reserve[v])) continue;
+        bool wire = false;
+        for (long gy = gy0; gy <= gy1 && !wire; ++gy) {
+            for (long gx = gx0; gx <= gx1; ++gx) {
+                long const tx = gx / g.n, ty = gy / g.n;
+                int const slot = static_cast<int>((ty - ty0) * (tx1 - tx0 + 1) + (tx - tx0));
+                long const col = gx - tx * g.n;
+                long const row = g.n - 1 - (gy - ty * g.n);
+                std::size_t const bit = static_cast<std::size_t>(row) * g.n + static_cast<std::size_t>(col);
+                if ((g.bits[checked[i].offset[slot] + (bit >> 3)] >> (7 - (bit & 7))) & 1) {
+                    wire = true;
+                    break;
+                }
+            }
+        }
+        if (!wire) return false;   /* a clean view */
+        any_wire = true;
+    }
+    return any_wire;
+}
+
+/**
+ * PATCH8: faces under wires made smaller, before anything else is computed on the mesh. mask_ground decides per face: a
+ * face with a wire in every view checked there cannot be painted without one. The 2.5D mesh has about the same number of
+ * faces whatever the area, so over a large area its faces are large (about 0.7 m over half a square kilometre, against
+ * 0.3 m over a few blocks), and under a bundle of cables nearly every view has a wire somewhere in nearly every face, even
+ * though each spot is clean in some view. Such a face is cut into four at the midpoints of its edges; a neighbour with two
+ * or three cut edges is cut into four too, one with a single cut edge into two, so that no edge has a vertex in its middle
+ * on one side only (that would leave a crack). Then the new faces are checked again, round after round, until each has a
+ * clean view or its longest edge is at most settings.wire_split_min_edge. The new vertices lie on the old edges, so the
+ * surface does not change; their colours and other values are the mean of the edge's ends, the normals are recomputed.
+ */
+void
+split_wire_faces(mve::TriangleMesh::Ptr mesh, std::vector<TextureView> const & texture_views, Settings const & settings) {
+    if (settings.masked_ground_file.empty() || settings.wire_split_min_edge <= 0.0f) return;
+    GroundMasks g;
+    if (!read_ground_masks(settings.masked_ground_file, texture_views, &g, true)) return;
+    ViewSurveys vs;
+    bool const surveys = !settings.view_surveys_file.empty()
+        && read_view_surveys(settings.view_surveys_file, texture_views, &vs, true);
+
+    std::vector<unsigned int> & faces = mesh->get_faces();
+    std::vector<math::Vec3f> & verts = mesh->get_vertices();
+    mve::TriangleMesh::ColorList & vcolors = mesh->get_vertex_colors();
+    mve::TriangleMesh::ConfidenceList & vconf = mesh->get_vertex_confidences();
+    mve::TriangleMesh::ValueList & vvalues = mesh->get_vertex_values();
+    mve::TriangleMesh::TexCoordList & vtex = mesh->get_vertex_texcoords();
+    mve::TriangleMesh::ColorList & fcolors = mesh->get_face_colors();
+    float const min_edge = settings.wire_split_min_edge;
+    std::size_t const faces_before = faces.size() / 3;
+    std::size_t const verts_before = verts.size();
+
+    auto edge_key = [](unsigned int a, unsigned int b) -> std::uint64_t {
+        if (a > b) std::swap(a, b);
+        return (static_cast<std::uint64_t>(a) << 32) | b;
+    };
+
+    /* faces to check in this round: all at first, then only those made in the round before */
+    std::vector<char> fresh(faces_before, 1);
+    int rounds = 0;
+    long long first_round = 0;
+    for (int round = 1; round <= 12; ++round) {
+        std::int64_t const nf = static_cast<std::int64_t>(faces.size() / 3);
+        std::vector<char> red(nf, 0);
+        long long need = 0;
+        #pragma omp parallel for schedule(dynamic, 4096) reduction(+:need)
+        for (std::int64_t f = 0; f < nf; ++f) {
+            if (!fresh[f]) continue;
+            math::Vec3f const & a = verts[faces[f * 3]];
+            math::Vec3f const & b = verts[faces[f * 3 + 1]];
+            math::Vec3f const & c = verts[faces[f * 3 + 2]];
+            float const longest = std::max((a - b).norm(), std::max((b - c).norm(), (c - a).norm()));
+            if (longest <= min_edge) continue;
+            if (wire_in_every_view(g, surveys ? &vs : nullptr, a, b, c)) {
+                red[f] = 1;
+                need += 1;
+            }
+        }
+        if (need == 0) break;
+        if (round == 1) first_round = need;
+        rounds = round;
+
+        /* the edges to cut: those of the red faces, and of every face with two or more of them (made red as well) */
+        std::vector<std::uint64_t> cut;
+        for (std::int64_t f = 0; f < nf; ++f) {
+            if (!red[f]) continue;
+            unsigned int const * v = &faces[f * 3];
+            cut.push_back(edge_key(v[0], v[1])); cut.push_back(edge_key(v[1], v[2])); cut.push_back(edge_key(v[2], v[0]));
+        }
+        std::sort(cut.begin(), cut.end());
+        cut.erase(std::unique(cut.begin(), cut.end()), cut.end());
+        auto is_cut = [&cut](std::uint64_t k) { return std::binary_search(cut.begin(), cut.end(), k); };
+        long long promoted = 0;
+        for (bool changed = true; changed; ) {
+            changed = false;
+            std::vector<std::uint64_t> added;
+            for (std::int64_t f = 0; f < nf; ++f) {
+                if (red[f]) continue;
+                unsigned int const * v = &faces[f * 3];
+                std::uint64_t const k[3] = {edge_key(v[0], v[1]), edge_key(v[1], v[2]), edge_key(v[2], v[0])};
+                int const m = (is_cut(k[0]) ? 1 : 0) + (is_cut(k[1]) ? 1 : 0) + (is_cut(k[2]) ? 1 : 0);
+                if (m >= 2) {
+                    red[f] = 1;
+                    promoted += 1;
+                    added.insert(added.end(), k, k + 3);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                cut.insert(cut.end(), added.begin(), added.end());
+                std::sort(cut.begin(), cut.end());
+                cut.erase(std::unique(cut.begin(), cut.end()), cut.end());
+            }
+        }
+
+        /* a new vertex in the middle of every cut edge */
+        std::size_t const nv = verts.size();
+        std::vector<unsigned int> mid(cut.size());
+        bool const has_colors = vcolors.size() == nv, has_conf = vconf.size() == nv;
+        bool const has_values = vvalues.size() == nv, has_tex = vtex.size() == nv;
+        for (std::size_t e = 0; e < cut.size(); ++e) {
+            unsigned int const a = static_cast<unsigned int>(cut[e] >> 32);
+            unsigned int const b = static_cast<unsigned int>(cut[e] & 0xffffffffu);
+            mid[e] = static_cast<unsigned int>(verts.size());
+            math::Vec3f const p = (verts[a] + verts[b]) * 0.5f;
+            verts.push_back(p);
+            if (has_colors) { math::Vec4f const q = (vcolors[a] + vcolors[b]) * 0.5f; vcolors.push_back(q); }
+            if (has_conf) { float const q = (vconf[a] + vconf[b]) * 0.5f; vconf.push_back(q); }
+            if (has_values) { float const q = (vvalues[a] + vvalues[b]) * 0.5f; vvalues.push_back(q); }
+            if (has_tex) { math::Vec2f const q = (vtex[a] + vtex[b]) * 0.5f; vtex.push_back(q); }
+        }
+        auto middle = [&](unsigned int a, unsigned int b) -> long {
+            std::uint64_t const k = edge_key(a, b);
+            std::vector<std::uint64_t>::const_iterator const it = std::lower_bound(cut.begin(), cut.end(), k);
+            return (it != cut.end() && *it == k) ? static_cast<long>(mid[it - cut.begin()]) : -1L;
+        };
+
+        /* the new faces, in the same turning direction as the old */
+        std::vector<unsigned int> out;
+        out.reserve(faces.size() + 9 * static_cast<std::size_t>(need + promoted));
+        bool const has_fcolors = fcolors.size() == static_cast<std::size_t>(nf);
+        mve::TriangleMesh::ColorList fout;
+        std::vector<char> next_fresh;
+        long long halved = 0;
+        for (std::int64_t f = 0; f < nf; ++f) {
+            unsigned int const a = faces[f * 3], b = faces[f * 3 + 1], c = faces[f * 3 + 2];
+            long const ab = middle(a, b), bc = middle(b, c), ca = middle(c, a);
+            std::size_t const before = out.size();
+            if (red[f]) {
+                unsigned int const m1 = ab, m2 = bc, m3 = ca;
+                unsigned int const t[12] = {a, m1, m3, m1, b, m2, m3, m2, c, m1, m2, m3};
+                out.insert(out.end(), t, t + 12);
+            } else if (ab >= 0) {
+                unsigned int const t[6] = {a, static_cast<unsigned int>(ab), c, static_cast<unsigned int>(ab), b, c};
+                out.insert(out.end(), t, t + 6);
+                halved += 1;
+            } else if (bc >= 0) {
+                unsigned int const t[6] = {a, b, static_cast<unsigned int>(bc), a, static_cast<unsigned int>(bc), c};
+                out.insert(out.end(), t, t + 6);
+                halved += 1;
+            } else if (ca >= 0) {
+                unsigned int const t[6] = {a, b, static_cast<unsigned int>(ca), static_cast<unsigned int>(ca), b, c};
+                out.insert(out.end(), t, t + 6);
+                halved += 1;
+            } else {
+                unsigned int const t[3] = {a, b, c};
+                out.insert(out.end(), t, t + 3);
+            }
+            std::size_t const made = (out.size() - before) / 3;
+            /* every face made in this round (four or two from one) is checked in the next; the others stay as they were */
+            next_fresh.insert(next_fresh.end(), made, made > 1 ? 1 : 0);
+            if (has_fcolors) fout.insert(fout.end(), made, fcolors[f]);
+        }
+        faces.swap(out);
+        if (has_fcolors) fcolors.swap(fout);
+        fresh.swap(next_fresh);
+        std::cout << "\t[PATCH8] Faces under wires, round " << round << ": " << need
+            << " with a wire in every view checked there cut into four (and " << promoted << " neighbours), "
+            << halved << " neighbours cut into two, " << faces.size() / 3 << " faces now" << std::endl;
+    }
+
+    if (rounds == 0) {
+        std::cout << "\t[PATCH8] No face with a wire in every view checked there larger than " << min_edge << " m" << std::endl;
+        return;
+    }
+    /* the normals are recomputed by prepare_mesh */
+    mesh->get_vertex_normals().clear();
+    mesh->get_face_normals().clear();
+    std::size_t const faces_after = faces.size() / 3;
+    std::cout << "\t[PATCH8] Faces under wires split in " << rounds << " rounds, down to " << min_edge << " m: "
+        << first_round << " faces at first; " << faces_before << " faces became " << faces_after << " (+"
+        << (faces_after - faces_before) * 100 / std::max<std::size_t>(1, faces_before) << " %), "
+        << verts.size() - verts_before << " vertices added" << std::endl;
 }
 
 /**

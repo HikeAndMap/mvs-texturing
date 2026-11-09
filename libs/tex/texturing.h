@@ -46,6 +46,13 @@ void
 prepare_mesh(mve::MeshInfo * mesh_info, mve::TriangleMesh::Ptr mesh);
 
 /**
+  * PATCH8: cuts the faces with a wire in every view checked there (settings.masked_ground_file) into smaller faces, round
+  * after round, down to settings.wire_split_min_edge. Call before prepare_mesh.
+  */
+void
+split_wire_faces(mve::TriangleMesh::Ptr mesh, std::vector<TextureView> const & texture_views, Settings const & settings);
+
+/**
   * Generates TextureViews from the in_scene.
   */
 mve::ImageType

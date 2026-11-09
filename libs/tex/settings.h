@@ -107,6 +107,10 @@ struct Settings {
      * a wire over it, as long as a view without one (and checked there) sees it (empty: none). */
     std::string masked_ground_file;
 
+    /* PATCH8: with wire masks, a face with a wire in every view checked there is cut into smaller faces, again and again,
+     * until one of its views is clean or its longest edge is at most this (metres). 0: faces are not split. */
+    float wire_split_min_edge = 0.12f;
+
     /* PATCH10: file with the survey of every view (rank 0 = the newest) and whether the view is a reserve view (an older
      * photo inside a newer survey: it paints only GCP squares and the ground under vehicles). Empty: one survey, as before. */
     std::string view_surveys_file;

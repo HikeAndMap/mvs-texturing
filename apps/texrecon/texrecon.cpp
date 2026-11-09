@@ -71,12 +71,19 @@ int main(int argc, char **argv) {
         std::cerr << "\tCould not load mesh: " << e.what() << std::endl;
         std::exit(EXIT_FAILURE);
     }
-    mve::MeshInfo mesh_info(mesh);
-    tex::prepare_mesh(&mesh_info, mesh);
 
     std::cout << "Generating texture views: " << std::endl;
     tex::TextureViews texture_views;
     mve::ImageType type = tex::generate_texture_views(conf.in_scene, &texture_views, tmp_dir);
+
+    /* PATCH8: faces under wires cut smaller first (needs the views' names to read the wire masks); prepare_mesh then
+     * computes the normals and vertex infos of the mesh as it is from here on. */
+    if (!conf.settings.masked_ground_file.empty() && conf.settings.wire_split_min_edge > 0.0f) {
+        std::cout << "Splitting faces under wires: " << std::endl;
+        tex::split_wire_faces(mesh, texture_views, conf.settings);
+    }
+    mve::MeshInfo mesh_info(mesh);
+    tex::prepare_mesh(&mesh_info, mesh);
 
     write_string_to_file(conf.out_prefix + ".conf", conf.to_string());
     timer.measure("Loading");

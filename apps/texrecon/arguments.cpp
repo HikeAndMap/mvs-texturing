@@ -23,6 +23,7 @@
 #define FORCED_VIEWS "forced_views"
 #define MASKED_BOXES "masked_boxes"
 #define MASKED_GROUND "masked_ground"
+#define WIRE_SPLIT_MIN_EDGE "wire_split_min_edge"
 #define VIEW_SURVEYS "view_surveys"
 #define SURVEY_MAX_ANGLE "survey_max_angle"
 #define WRITE_LABELING "write_labeling"
@@ -110,6 +111,9 @@ Arguments parse_args(int argc, char **argv) {
     args.add_option('\0', MASKED_GROUND, true,
         "File with wire masks per view and tile in mesh coordinates (ODX wire_masks.py). "
         "A face is not painted from a view with a wire over it, as long as a view without one sees it");
+    args.add_option('\0', WIRE_SPLIT_MIN_EDGE, true,
+        "With masked_ground: a face with a wire in every view checked there is cut into smaller faces until a view is "
+        "clean or its longest edge is at most this many metres; 0 = no splitting [0.12]");
     args.add_option('\0', VIEW_SURVEYS, true,
         "File with the survey of every view, one per line: image_name rank reserve (rank 0 = the newest survey; reserve 1 = "
         "an older photo inside a newer survey). A face is painted from the newest survey that sees it within the survey "
@@ -188,6 +192,8 @@ Arguments parse_args(int argc, char **argv) {
                 conf.settings.masked_boxes_file = i->arg;
             } else if (i->opt->lopt == MASKED_GROUND) {
                 conf.settings.masked_ground_file = i->arg;
+            } else if (i->opt->lopt == WIRE_SPLIT_MIN_EDGE) {
+                conf.settings.wire_split_min_edge = std::stof(i->arg);
             } else if (i->opt->lopt == VIEW_SURVEYS) {
                 conf.settings.view_surveys_file = i->arg;
             } else if (i->opt->lopt == SURVEY_MAX_ANGLE) {
@@ -227,6 +233,7 @@ Arguments::to_string(){
         << "Forced views file: \t" << settings.forced_views_file << std::endl
         << "Masked boxes file: \t" << settings.masked_boxes_file << std::endl
         << "Masked ground file: \t" << settings.masked_ground_file << std::endl
+        << "Wire split min edge: \t" << settings.wire_split_min_edge << std::endl
         << "View surveys file: \t" << settings.view_surveys_file << std::endl
         << "Survey max angle: \t" << settings.survey_max_angle << std::endl
         << "Data term: \t" << choice_string<tex::DataTerm>(settings.data_term) << std::endl
