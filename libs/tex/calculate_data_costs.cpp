@@ -621,7 +621,17 @@ struct GroundMasks {
     /* per tile (ty * nx + tx): (view index into texture_views, offset of its mask in bits), sorted by view */
     std::vector<std::vector<std::pair<int, std::size_t> > > tiles;
     std::vector<unsigned char> bits;
+    /* HAMWIRE2: every mask is followed by its checked cells (mask_bytes further on); HAMWIRE1: the whole tile was checked */
+    bool has_checked = false;
+    std::size_t mask_bytes = 0;
 };
+
+/* PATCH8: one cell of a view's mask (offset of the mask, bit of the cell): 0 clean, 1 wire, 2 not checked there. */
+inline int
+ground_cell(GroundMasks const & g, std::size_t offset, std::size_t bit) {
+    if (g.has_checked && !((g.bits[offset + g.mask_bytes + (bit >> 3)] >> (7 - (bit & 7))) & 1)) return 2;
+    return ((g.bits[offset + (bit >> 3)] >> (7 - (bit & 7))) & 1) ? 1 : 0;
+}
 
 template <typename T>
 bool read_value(std::ifstream & in, T * value) {
@@ -630,16 +640,17 @@ bool read_value(std::ifstream & in, T * value) {
 }
 
 /**
- * PATCH8: reads the wire masks file: magic HAMWIRE1, x0 y0 tile cell (doubles), nx ny n (int32), the view names, then
- * per mask: tile x, tile y, view (int32) and n * n bits (row 0 = north, numpy packbits order). Views are matched by
- * image name as in read_forced_squares. Returns false if the file cannot be read.
+ * PATCH8: reads the wire masks file: magic HAMWIRE1 or HAMWIRE2, x0 y0 tile cell (doubles), nx ny n (int32), the view
+ * names, then per mask: tile x, tile y, view (int32) and n * n bits (row 0 = north, numpy packbits order), in HAMWIRE2
+ * followed by n * n bits of the cells checked in that view. Views are matched by image name as in read_forced_squares.
+ * Returns false if the file cannot be read.
  */
 bool
 read_ground_masks(std::string const & filename, std::vector<TextureView> const & texture_views, GroundMasks * g,
     bool quiet = false) {
     std::ifstream in(filename.c_str(), std::ios::binary);
     char magic[8];
-    if (!in.good() || !in.read(magic, 8) || std::string(magic, 8) != "HAMWIRE1") {
+    if (!in.good() || !in.read(magic, 8) || (std::string(magic, 8) != "HAMWIRE1" && std::string(magic, 8) != "HAMWIRE2")) {
         std::cout << "\t[PATCH8] Cannot read the wire masks file " << filename << std::endl;
         return false;
     }
@@ -650,6 +661,7 @@ read_ground_masks(std::string const & filename, std::vector<TextureView> const &
         return false;
     }
     g->nx = nx; g->ny = ny; g->n = n;
+    g->has_checked = std::string(magic, 8) == "HAMWIRE2";
 
     std::map<std::string, std::size_t> by_name;
     for (std::size_t j = 0; j < texture_views.size(); ++j) {
@@ -680,21 +692,23 @@ read_ground_masks(std::string const & filename, std::vector<TextureView> const &
     std::int64_t num_masks;
     if (!read_value(in, &num_masks)) return false;
     std::size_t const mask_bytes = (static_cast<std::size_t>(n) * n + 7) / 8;
+    std::size_t const record = mask_bytes * (g->has_checked ? 2 : 1);
+    g->mask_bytes = mask_bytes;
     g->tiles.assign(static_cast<std::size_t>(nx) * ny, std::vector<std::pair<int, std::size_t> >());
-    g->bits.resize(static_cast<std::size_t>(num_masks) * mask_bytes);
+    g->bits.resize(static_cast<std::size_t>(num_masks) * record);
     std::size_t used = 0, unknown = 0;
     for (std::int64_t m = 0; m < num_masks; ++m) {
         std::int32_t tx, ty, k;
         if (!read_value(in, &tx) || !read_value(in, &ty) || !read_value(in, &k)) return false;
-        if (!in.read(reinterpret_cast<char *>(&g->bits[used * mask_bytes]), mask_bytes)) return false;
+        if (!in.read(reinterpret_cast<char *>(&g->bits[used * record]), record)) return false;
         if (k < 0 || k >= num_names || view_of[k] < 0 || tx < 0 || ty < 0 || tx >= nx || ty >= ny) {
             unknown += 1;
             continue;
         }
-        g->tiles[static_cast<std::size_t>(ty) * nx + tx].push_back(std::make_pair(view_of[k], used * mask_bytes));
+        g->tiles[static_cast<std::size_t>(ty) * nx + tx].push_back(std::make_pair(view_of[k], used * record));
         used += 1;
     }
-    g->bits.resize(used * mask_bytes);
+    g->bits.resize(used * record);
     for (std::size_t t = 0; t < g->tiles.size(); ++t)
         std::sort(g->tiles[t].begin(), g->tiles[t].end());
 
@@ -774,7 +788,9 @@ mask_ground(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & t
                     long const c = gx - tx * g.n;
                     long const r = g.n - 1 - (gy - ty * g.n);
                     std::size_t const bit = static_cast<std::size_t>(r) * g.n + static_cast<std::size_t>(c);
-                    if ((g.bits[offset + (bit >> 3)] >> (7 - (bit & 7))) & 1) {
+                    int const cell = ground_cell(g, offset, bit);
+                    if (cell == 2) { st = 2; break; }
+                    if (cell == 1) {
                         st = 1;
                         cells += 1;
                     }
@@ -955,25 +971,26 @@ wire_in_every_view(GroundMasks const & g, ViewSurveys const * vs, math::Vec3f co
             if (!vs->reserve[v] && (newest < 0 || vs->rank[v] < newest)) newest = vs->rank[v];
         }
     }
+    /* (a view with a mask on the tiles may still not have checked every cell under the face; it then counts neither way) */
 
     bool any_wire = false;
     for (std::size_t i = 0; i < checked.size(); ++i) {
         int const v = checked[i].view;
         if (newest >= 0 && (vs->rank[v] != newest || vs->reserve[v])) continue;
-        bool wire = false;
-        for (long gy = gy0; gy <= gy1 && !wire; ++gy) {
+        bool wire = false, unchecked = false;
+        for (long gy = gy0; gy <= gy1 && !unchecked; ++gy) {
             for (long gx = gx0; gx <= gx1; ++gx) {
                 long const tx = gx / g.n, ty = gy / g.n;
                 int const slot = static_cast<int>((ty - ty0) * (tx1 - tx0 + 1) + (tx - tx0));
                 long const col = gx - tx * g.n;
                 long const row = g.n - 1 - (gy - ty * g.n);
                 std::size_t const bit = static_cast<std::size_t>(row) * g.n + static_cast<std::size_t>(col);
-                if ((g.bits[checked[i].offset[slot] + (bit >> 3)] >> (7 - (bit & 7))) & 1) {
-                    wire = true;
-                    break;
-                }
+                int const cell = ground_cell(g, checked[i].offset[slot], bit);
+                if (cell == 2) { unchecked = true; break; }
+                if (cell == 1) wire = true;
             }
         }
+        if (unchecked) continue;   /* not checked on all of the face: counts neither way */
         if (!wire) return false;   /* a clean view */
         any_wire = true;
     }
