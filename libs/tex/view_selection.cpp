@@ -11,6 +11,7 @@
 
 #include "util.h"
 #include "texturing.h"
+#include "step_timer.h"
 #include "mapmap/full.h"
 
 TEX_NAMESPACE_BEGIN
@@ -22,6 +23,8 @@ view_selection(DataCosts const & data_costs, UniGraph * graph, Settings const &)
     constexpr uint_t simd_w = mapmap::sys_max_simd_width<cost_t>();
     using unary_t = mapmap::UnaryTable<cost_t, simd_w>;
     using pairwise_t = mapmap::PairwisePotts<cost_t, simd_w>;
+
+    StepTimer step_timer;
 
     /* Construct graph */
     mapmap::Graph<cost_t> mgraph(graph->num_nodes());
@@ -40,7 +43,9 @@ view_selection(DataCosts const & data_costs, UniGraph * graph, Settings const &)
             }
         }
     }
+    step_timer.step("optimization graph (" + std::to_string(graph->num_nodes()) + " faces)");
     mgraph.update_components();
+    step_timer.step("its connected parts");
 
     mapmap::LabelSet<cost_t, simd_w> label_set(graph->num_nodes(), false);
     for (std::size_t i = 0; i < data_costs.cols(); ++i) {
@@ -58,6 +63,7 @@ view_selection(DataCosts const & data_costs, UniGraph * graph, Settings const &)
 
         label_set.set_label_set_for_node(i, labels);
     }
+    step_timer.step("the views of every face");
 
     std::vector<unary_t> unaries;
     unaries.reserve(data_costs.cols());
@@ -80,6 +86,7 @@ view_selection(DataCosts const & data_costs, UniGraph * graph, Settings const &)
         unaries.emplace_back(i, &label_set);
         unaries.back().set_costs(costs);
     }
+    step_timer.step("the costs of every face");
 
     mapmap::StopWhenReturnsDiminish<cost_t, simd_w> terminate(5, 0.01);
     std::vector<mapmap::_iv_st<cost_t, simd_w> > solution;
@@ -116,6 +123,7 @@ view_selection(DataCosts const & data_costs, UniGraph * graph, Settings const &)
 
     std::cout << "\tOptimizing:\n\t\tTime[s]\tEnergy" << std::endl;
     solver.optimize(solution, ctr);
+    step_timer.step("optimization");
 
     /* Label 0 is undefined. */
     std::size_t num_labels = data_costs.rows() + 1;
@@ -130,6 +138,7 @@ view_selection(DataCosts const & data_costs, UniGraph * graph, Settings const &)
         graph->set_label(i, static_cast<std::size_t>(label));
     }
     std::cout << '\t' << undefined << " faces have not been seen" << std::endl;
+    step_timer.step("view per face read back");
 }
 
 TEX_NAMESPACE_END

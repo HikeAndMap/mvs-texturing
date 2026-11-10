@@ -22,7 +22,8 @@ class Histogram {
         std::vector<unsigned int> bins;
         float min;
         float max;
-        int num_values;
+        /* PATCH9: 64 bits: a large mesh has more than 2^31 face qualities */
+        long long num_values;
 
     public:
         /** Constructs a histogram with num_bins bins which clamps values to [_min, _max]. */
@@ -30,6 +31,9 @@ class Histogram {
 
         /** Adds a value to the histogram. The value is clamped to [min, max]. */
         void add_value(float value);
+
+        /** PATCH9: adds the values of another histogram with the same range and bins (one per thread, then merged). */
+        void add(Histogram const & other);
 
         /**
           * Saves the histogram to a .csv file.

@@ -34,6 +34,13 @@ Histogram::add_value(float value) {
 }
 
 void
+Histogram::add(Histogram const & other) {
+    assert(other.bins.size() == bins.size() && other.min == min && other.max == max);
+    for (std::size_t i = 0; i < bins.size(); ++i) bins[i] += other.bins[i];
+    num_values += other.num_values;
+}
+
+void
 Histogram::save_to_file(std::string const & filename) const {
     std::ofstream out(filename.c_str());
     if (!out.good())
@@ -50,7 +57,7 @@ float
 Histogram::get_approx_percentile(float percentile) const {
     assert(percentile >= 0.0f && percentile <= 1.0f);
 
-    int num = 0;
+    long long num = 0;
     float upper_bound = min;
     for (std::size_t i = 0; i < bins.size(); ++i) {
         if (static_cast<float>(num) / num_values > percentile)

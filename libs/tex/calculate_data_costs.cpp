@@ -26,6 +26,7 @@
 #include "texturing.h"
 #include "sparse_table.h"
 #include "progress_counter.h"
+#include "step_timer.h"
 
 typedef acc::BVHTree<unsigned int, math::Vec3f> BVHTree;
 
@@ -307,6 +308,7 @@ postprocess_face_infos(Settings const & settings,
         FaceProjectionInfos * face_projection_infos,
         DataCosts * data_costs) {
 
+    StepTimer step_timer;
     ProgressCounter face_counter("\tPostprocessing face infos",
         face_projection_infos->size());
     #pragma omp parallel for schedule(dynamic)
@@ -329,32 +331,59 @@ postprocess_face_infos(Settings const & settings,
 
         face_counter.inc();
     }
+    step_timer.step("outliers removed and views sorted per face");
+
+    /* PATCH9: the maximum, the histogram and the costs on all cores (the same values as on one core: the maximum and the
+     * bin counts do not depend on the order, and every face fills only its own column, in the same order). */
+    std::int64_t const num_faces = static_cast<std::int64_t>(face_projection_infos->size());
 
     /* Determine the function for the normlization. */
     float max_quality = 0.0f;
-    for (std::size_t i = 0; i < face_projection_infos->size(); ++i)
-        for (FaceProjectionInfo const & info : face_projection_infos->at(i))
-            max_quality = std::max(max_quality, info.quality);
+    #pragma omp parallel
+    {
+        float thread_max = 0.0f;
+        #pragma omp for schedule(dynamic, 65536)
+        for (std::int64_t i = 0; i < num_faces; ++i)
+            for (FaceProjectionInfo const & info : face_projection_infos->at(i))
+                thread_max = std::max(thread_max, info.quality);
+        #pragma omp critical
+        max_quality = std::max(max_quality, thread_max);
+    }
 
     Histogram hist_qualities(0.0f, max_quality, 10000);
-    for (std::size_t i = 0; i < face_projection_infos->size(); ++i)
-        for (FaceProjectionInfo const & info : face_projection_infos->at(i))
-            hist_qualities.add_value(info.quality);
+    #pragma omp parallel
+    {
+        Histogram thread_hist(0.0f, max_quality, 10000);
+        #pragma omp for schedule(dynamic, 65536)
+        for (std::int64_t i = 0; i < num_faces; ++i)
+            for (FaceProjectionInfo const & info : face_projection_infos->at(i))
+                thread_hist.add_value(info.quality);
+        #pragma omp critical
+        hist_qualities.add(thread_hist);
+    }
     float percentile = hist_qualities.get_approx_percentile(0.995f);
+    step_timer.step("highest quality and its 99.5 % mark");
 
     /* Calculate the costs. */
-    for (std::uint32_t i = 0; i < face_projection_infos->size(); ++i) {
-        for (FaceProjectionInfo const & info : face_projection_infos->at(i)) {
+    #pragma omp parallel for schedule(dynamic, 65536)
+    for (std::int64_t i = 0; i < num_faces; ++i) {
+        std::vector<FaceProjectionInfo> & infos = face_projection_infos->at(i);
+        DataCosts::Column column;
+        column.reserve(infos.size());
+        for (FaceProjectionInfo const & info : infos) {
 
             /* Clamp to percentile and normalize. */
             float normalized_quality = std::min(1.0f, info.quality / percentile);
             float data_cost = (1.0f - normalized_quality);
-            data_costs->set_value(i, info.view_id, data_cost);
+            column.push_back(std::make_pair(info.view_id, data_cost));
         }
+        data_costs->set_column(static_cast<std::uint32_t>(i), std::move(column));
 
         /* Ensure that all memory is freeed. */
-        face_projection_infos->at(i) = std::vector<FaceProjectionInfo>();
+        infos = std::vector<FaceProjectionInfo>();
     }
+    data_costs->count_values();
+    step_timer.step("cost table (" + std::to_string(data_costs->get_nnz()) + " costs)");
 
     std::cout << "\tMaximum quality of a face within an image: " << max_quality << std::endl;
     std::cout << "\tClamping qualities to " << percentile << " within normalization." << std::endl;
@@ -1400,10 +1429,13 @@ calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> 
     if (num_views > std::numeric_limits<std::uint16_t>::max())
         throw std::runtime_error("Exeeded maximal number of views");
 
+    StepTimer step_timer;
     FaceProjectionInfos face_projection_infos(num_faces);
     calculate_face_projection_infos(mesh, texture_views, settings, &face_projection_infos);
+    step_timer.step("face qualities (BVH and every view)");
     if (!settings.forced_views_file.empty()) {
         force_views(mesh, *texture_views, settings.forced_views_file, &face_projection_infos);
+        step_timer.step("[PATCH4] forced squares");
     }
     std::vector<std::vector<MaskedBox> > boxes;
     if (!settings.masked_boxes_file.empty()) {
@@ -1411,12 +1443,15 @@ calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> 
     }
     if (!settings.view_surveys_file.empty()) {
         prioritize_surveys(mesh, *texture_views, settings, boxes, &face_projection_infos);
+        step_timer.step("[PATCH10] newest survey first");
     }
     if (!boxes.empty()) {
         mask_views(mesh, *texture_views, boxes, &face_projection_infos);
+        step_timer.step("[PATCH7] vehicles and people");
     }
     if (!settings.masked_ground_file.empty()) {
         mask_ground(mesh, *texture_views, settings.masked_ground_file, &face_projection_infos);
+        step_timer.step("[PATCH8] overhead wires");
     }
     postprocess_face_infos(settings, &face_projection_infos, data_costs);
 }

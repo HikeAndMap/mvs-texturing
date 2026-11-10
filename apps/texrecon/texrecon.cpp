@@ -24,6 +24,7 @@
 #include "tex/debug.h"
 #include "tex/texturing.h"
 #include "tex/progress_counter.h"
+#include "tex/step_timer.h"
 
 #include "arguments.h"
 
@@ -33,6 +34,7 @@ int main(int argc, char **argv) {
 
     Timer timer;
     util::WallTimer wtimer;
+    tex::StepTimer step_timer;
 
     Arguments conf;
     try {
@@ -75,15 +77,18 @@ int main(int argc, char **argv) {
     std::cout << "Generating texture views: " << std::endl;
     tex::TextureViews texture_views;
     mve::ImageType type = tex::generate_texture_views(conf.in_scene, &texture_views, tmp_dir);
+    step_timer.step("mesh and views loaded");
 
     /* PATCH8: faces under wires cut smaller first (needs the views' names to read the wire masks); prepare_mesh then
      * computes the normals and vertex infos of the mesh as it is from here on. */
     if (!conf.settings.masked_ground_file.empty() && conf.settings.wire_split_min_edge > 0.0f) {
         std::cout << "Splitting faces under wires: " << std::endl;
         tex::split_wire_faces(mesh, texture_views, conf.settings);
+        step_timer.step("[PATCH8] faces under wires split");
     }
     mve::MeshInfo mesh_info(mesh);
     tex::prepare_mesh(&mesh_info, mesh);
+    step_timer.step("mesh prepared");
 
     write_string_to_file(conf.out_prefix + ".conf", conf.to_string());
     timer.measure("Loading");
@@ -93,6 +98,7 @@ int main(int argc, char **argv) {
     std::cout << "Building adjacency graph: " << std::endl;
     tex::Graph graph(num_faces);
     tex::build_adjacency_graph(mesh, mesh_info, &graph);
+    step_timer.step("adjacency graph");
 
     if (conf.labeling_file.empty()) {
         std::cout << "View selection:" << std::endl;
@@ -119,6 +125,7 @@ int main(int argc, char **argv) {
             std::cout << "done." << std::endl;
         }
         timer.measure("Calculating data costs");
+        step_timer.step("data costs, all together");
 
         try {
             tex::view_selection(data_costs, &graph, conf.settings);
@@ -128,6 +135,7 @@ int main(int argc, char **argv) {
         }
         timer.measure("Running MRF optimization");
         std::cout << "\tTook: " << rwtimer.get_elapsed_sec() << "s" << std::endl;
+        step_timer.step("view selection, all together");
 
         /* Write labeling to file. */
         if (conf.write_intermediate_results || conf.write_labeling) {
@@ -163,6 +171,7 @@ int main(int argc, char **argv) {
                 faces_out.write(reinterpret_cast<char const *>(&label), sizeof(label));
             }
         }
+        if (conf.write_intermediate_results || conf.write_labeling) step_timer.step("labeling written");
     } else {
         std::cout << "Loading labeling from file... " << std::flush;
 
@@ -194,11 +203,13 @@ int main(int argc, char **argv) {
         std::cout << "Generating texture patches:" << std::endl;
         tex::generate_texture_patches(graph, mesh, mesh_info, &texture_views,
             conf.settings, &vertex_projection_infos, &texture_patches);
+        step_timer.step("texture patches");
 
         if (conf.settings.global_seam_leveling) {
             std::cout << "Running global seam leveling:" << std::endl;
             tex::global_seam_leveling(graph, mesh, mesh_info, vertex_projection_infos, &texture_patches);
             timer.measure("Running global seam leveling");
+            step_timer.step("global seam leveling");
         } else {
             ProgressCounter texture_patch_counter("Calculating validity masks for texture patches", texture_patches.size());
             #pragma omp parallel for schedule(dynamic)
@@ -214,11 +225,13 @@ int main(int argc, char **argv) {
                 texture_patch_counter.inc();
             }
             timer.measure("Calculating texture patch validity masks");
+            step_timer.step("texture patch validity masks");
         }
 
         if (conf.settings.local_seam_leveling) {
             std::cout << "Running local seam leveling:" << std::endl;
             tex::local_seam_leveling(graph, mesh, vertex_projection_infos, &texture_patches);
+            step_timer.step("local seam leveling");
         }
         timer.measure("Running local seam leveling");
 
@@ -227,7 +240,9 @@ int main(int argc, char **argv) {
 
         bool grayscale = texture_views.front().is_grayscale();
         tex::generate_texture_atlases(&texture_patches, conf.settings, &texture_atlases, type, grayscale);
+        step_timer.step("texture atlases");
     }
+    step_timer.step("texture patches freed");
 
     /* Create and write out obj model. */
     {
@@ -235,11 +250,13 @@ int main(int argc, char **argv) {
         tex::Model model;
         tex::build_model(mesh, texture_atlases, &model);
         timer.measure("Building OBJ model");
+        step_timer.step("model built");
 
         std::cout << "\tSaving model... " << std::flush;
         tex::Model::save(model, conf.out_prefix);
         std::cout << "done." << std::endl;
         timer.measure("Saving");
+        step_timer.step("model saved");
     }
 
     std::cout << "Whole texturing procedure took: " << wtimer.get_elapsed_sec() << "s" << std::endl;

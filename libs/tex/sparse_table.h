@@ -11,6 +11,7 @@
 #define TEX_SPARSETABLE_HEADER
 
 #include <vector>
+#include <utility>
 
 #include <fstream>
 #include <cstring>
@@ -30,11 +31,12 @@ template <typename C, typename R, typename T>
 class SparseTable {
     public:
         typedef std::vector<std::pair<R, T> > Column;
-        typedef std::vector<std::pair<C, T> > Row;
 
     private:
+        /* PATCH9: columns only. The row-wise copy of every value was never read, held as much memory again as the
+         * columns, and had to be filled on one core (the rows are shared by all columns). */
         std::vector<Column> column_wise_data;
-        std::vector<Row> row_wise_data;
+        R num_rows;
 
         std::size_t nnz;
     public:
@@ -45,9 +47,13 @@ class SparseTable {
         R rows() const;
 
         Column const & col(C id) const;
-        Row const & row(R id) const;
 
         void set_value(C col, R row, T value);
+
+        /* PATCH9: sets a whole column; different columns can be set from several threads at the same time. Call
+         * count_values() once they are all set. */
+        void set_column(C col, Column && column);
+        void count_values();
 
         std::size_t get_nnz(void) const;
 
@@ -77,7 +83,7 @@ SparseTable<C, R, T>::cols() const {
 
 template <typename C, typename R, typename T> R
 SparseTable<C, R, T>::rows() const {
-    return row_wise_data.size();
+    return num_rows;
 }
 
 template <typename C, typename R, typename T> typename SparseTable<C, R, T>::Column const &
@@ -85,28 +91,34 @@ SparseTable<C, R, T>::col(C id) const {
     return column_wise_data[id];
 }
 
-template <typename C, typename R, typename T> typename SparseTable<C, R, T>::Row const &
-SparseTable<C, R, T>::row(R id) const {
-    return row_wise_data[id];
-}
-
 template <typename C, typename R, typename T>
 SparseTable<C, R, T>::SparseTable() {
+    num_rows = 0;
     nnz = 0;
 }
 
 template <typename C, typename R, typename T>
 SparseTable<C, R, T>::SparseTable(C cols, R rows) {
     column_wise_data.resize(cols);
-    row_wise_data.resize(rows);
+    num_rows = rows;
     nnz = 0;
 }
 
 template <typename C, typename R, typename T> void
 SparseTable<C, R, T>::set_value(C col, R row, T value) {
     column_wise_data[col].push_back(std::pair<R, T>(row, value));
-    row_wise_data[row].push_back(std::pair<C, T>(col, value));
     nnz++;
+}
+
+template <typename C, typename R, typename T> void
+SparseTable<C, R, T>::set_column(C col, Column && column) {
+    column_wise_data[col] = std::move(column);
+}
+
+template <typename C, typename R, typename T> void
+SparseTable<C, R, T>::count_values() {
+    nnz = 0;
+    for (Column const & column : column_wise_data) nnz += column.size();
 }
 
 template <typename C, typename R, typename T> void
