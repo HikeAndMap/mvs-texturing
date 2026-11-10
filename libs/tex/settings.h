@@ -111,6 +111,10 @@ struct Settings {
      * until one of its views is clean or its longest edge is at most this (metres). 0: faces are not split. */
     float wire_split_min_edge = 0.12f;
 
+    /* PATCH8: a face is cut only when cutting can win at least this many blocks (about wire_split_min_edge square) that
+     * are clean in some view but not in the view that would paint the whole face. */
+    int wire_split_min_gain = 1;
+
     /* PATCH10: file with the survey of every view (rank 0 = the newest) and whether the view is a reserve view (an older
      * photo inside a newer survey: it paints only GCP squares and the ground under vehicles). Empty: one survey, as before. */
     std::string view_surveys_file;
