@@ -1,0 +1,210 @@
+diff --git a/mapmap/source/mapmap.impl.h b/mapmap/source/mapmap.impl.h
+index 2edd8e3..7d637c7 100755
+--- a/mapmap/source/mapmap.impl.h
++++ b/mapmap/source/mapmap.impl.h
+@@ -10,6 +10,8 @@
+ #include <mapmap/header/mapmap.h>
+ 
+ #include <iostream>
++#include <chrono>
++#include <cstdio>
+ 
+ #include <mapmap/header/multilevel_instances/group_same_label.h>
+ #include <mapmap/header/termination_instances/stop_when_flat.h>
+@@ -614,6 +616,10 @@ _s_t<COSTTYPE, SIMDWIDTH>
+ mapMAP<COSTTYPE, SIMDWIDTH>::
+ opt_step_multilevel()
+ {
++    std::printf("\t\t[PATCH9] mapMAP multilevel step %llu\n",
++        (unsigned long long) (m_hist_multilevel_iterations + 1));
++    std::fflush(stdout);
++
+     std::vector<_iv_st<COSTTYPE, SIMDWIDTH>> lvl_solution;
+     std::vector<_iv_st<COSTTYPE, SIMDWIDTH>> upper_solution;
+     lvl_solution.assign(m_solution.begin(), m_solution.end());
+@@ -666,13 +672,24 @@ opt_step_multilevel()
+         lvl_opt.set_tree(lvl_tree.get());
+ 
+         /* optimize for level solution */
++        const auto patch9_start = std::chrono::steady_clock::now();
+         lvl_opt.optimize(upper_solution);
++        const double patch9_solve = std::chrono::duration<double>(
++            std::chrono::steady_clock::now() - patch9_start).count();
+ 
+         /* reproject solution to original and compute objective */
+         m_multilevel->reproject_solution(upper_solution, org_solution);
+         const _s_t<COSTTYPE, SIMDWIDTH> new_obj = org_opt.objective(
+             org_solution);
+ 
++        std::printf("\t\t[PATCH9] mapMAP level solved in %.1f s, energy "
++            "%.0f -> %.0f (%s), %.1f s with the energy\n", patch9_solve,
++            (double) m_objective, (double) new_obj,
++            new_obj < m_objective ? "kept, next level" : "not better, stop",
++            std::chrono::duration<double>(std::chrono::steady_clock::now()
++            - patch9_start).count());
++        std::fflush(stdout);
++
+         /* check if the solution was an improvement and save if necessary */
+         if(new_obj < m_objective)
+         {
+diff --git a/mapmap/source/multilevel.impl.h b/mapmap/source/multilevel.impl.h
+index dfb4115..864b1ae 100755
+--- a/mapmap/source/multilevel.impl.h
++++ b/mapmap/source/multilevel.impl.h
+@@ -13,6 +13,10 @@
+ #include <map>
+ #include <set>
+ #include <iostream>
++#include <chrono>
++#include <cstdio>
++#include <algorithm>
++#include <vector>
+ 
+ #include <oneapi/tbb/parallel_for.h>
+ #include <oneapi/tbb/blocked_range.h>
+@@ -194,24 +198,56 @@ next_level(
+     m_previous = &m_levels[m_level - 1];
+     m_current = &m_levels[m_level];
+ 
++    /* [PATCH9] time every part of building a level */
++    auto patch9_clock = std::chrono::steady_clock::now();
++    auto patch9_lap = [&patch9_clock]() {
++        const auto now = std::chrono::steady_clock::now();
++        const double s = std::chrono::duration<double>(now - patch9_clock).count();
++        patch9_clock = now;
++        return s;
++    };
++
+     /* group nodes to create supernodes (and project old solution) */
+     std::vector<_iv_st<COSTTYPE, SIMDWIDTH>> old_solution;
+     m_criterion->group_nodes(m_levels.back().prev_node_in_group,
+         &m_levels[m_level - 1], prev_solution, old_solution);
++    const double patch9_group = patch9_lap();
+ 
+     /* assign contiguous IDs to supernodes */
+     compute_contiguous_ids(old_solution);
++    const double patch9_ids = patch9_lap();
+ 
+     /* construct graph and record superedge lists */
+     compute_level_graph_from_node_groups();
++    const double patch9_graph = patch9_lap();
+ 
+     /* reconstruct label sets for upper level */
+     compute_level_label_set();
++    const double patch9_labels = patch9_lap();
+ 
+     /* compute level costs */
+     compute_level_cost_bundle();
+     compute_level_unaries();
+     compute_level_pairwise();
++    const double patch9_costs = patch9_lap();
++
++    {
++        luint_t largest = 0;
++        for(const luint_t sz : m_supernode_sizes)
++            largest = (std::max)(largest, sz);
++        std::printf("\t\t[PATCH9] mapMAP level %llu: %llu nodes in %llu groups "
++            "(largest %llu, %llu edges between groups); grouping %.1f s, "
++            "numbering %.1f s, graph %.1f s, views per group %.1f s, "
++            "costs %.1f s\n",
++            (unsigned long long) m_level,
++            (unsigned long long) m_previous->level_graph->num_nodes(),
++            (unsigned long long) m_num_supernodes,
++            (unsigned long long) largest,
++            (unsigned long long) m_superedge_list.size(),
++            patch9_group, patch9_ids, patch9_graph, patch9_labels,
++            patch9_costs);
++        std::fflush(stdout);
++    }
+ 
+     /* copy label indices for supernodes, projected from old solution */
+     projected_solution.resize(m_num_supernodes);
+@@ -499,11 +535,11 @@ compute_level_graph_from_node_groups()
+                 {
+                     std::lock_guard<std::mutex> lock(m_graph_write_mutex);
+ 
+-                    /* enlarge storage for edge table */
+-                    m_superedge_sizes.reserve(m_superedge_sizes.size() +
+-                        sedge_ids.size());
+-                    m_superedge_list.reserve(m_superedge_list.size() +
+-                        total);
++                    /**
++                     * [PATCH9] no reserve(size + n) here: it asks for exactly
++                     * that much room, so the whole list was copied once per
++                     * supernode. push_back grows the lists by doubling.
++                     */
+ 
+                     for(const auto& e : sedge_ids)
+                     {
+@@ -575,39 +611,57 @@ compute_level_label_set()
+     tbb::parallel_for(supernode_range,
+         [&](const tbb::blocked_range<luint_t>& r)
+         {
++            /**
++             * [PATCH9] the labels common to all nodes of a supernode, found
++             * by visiting only the nodes' own labels: count[l] = in how many
++             * of the nodes so far label l was found (only kept for the first
++             * node's labels, the candidates); seen[l] = the last node that
++             * counted l, so a label listed twice for a node counts once.
++             * Before, every label up to max_label was visited per node.
++             */
++            std::vector<luint_t> count(max_label + 1, 0);
++            std::vector<luint_t> seen(max_label + 1, invalid_luint_t);
++            luint_t stamp = 0;
++            std::vector<_iv_st<COSTTYPE, SIMDWIDTH>> candidates;
++
+             for(luint_t s_n = r.begin(); s_n != r.end(); ++s_n)
+             {
+-                /* collect intersection of incidence vectors */
+-                std::vector<bool> iset_labels(max_label + 1, true);
+-                std::vector<bool> inc_o_n(max_label + 1, false);
+                 std::vector<_iv_st<COSTTYPE, SIMDWIDTH>> lset;
++                candidates.clear();
+ 
+                 const luint_t s_num_nodes = m_supernode_sizes[s_n];
+                 for(luint_t i = 0; i < s_num_nodes; ++i)
+                 {
+-                    std::fill(inc_o_n.begin(), inc_o_n.end(), false);
+-
+                     const luint_t o_n = m_supernode_list[m_supernode_offsets[
+                         s_n] + i];
++                    ++stamp;
+ 
+-                    /* compute incidence vector for o_n */
+                     for(_iv_st<COSTTYPE, SIMDWIDTH> l_i = 0; l_i <
+                         m_previous->level_label_set->label_set_size(o_n); ++l_i)
+                     {
+                         const _iv_st<COSTTYPE, SIMDWIDTH> l =
+                             m_previous->level_label_set->label_from_offset(o_n,
+                             l_i);
+-                        inc_o_n[l] = true;
+-                    }
++                        if(seen[l] == stamp)
++                            continue;
++                        seen[l] = stamp;
+ 
+-                    /* intersect with common vector */
+-                    for(_iv_st<COSTTYPE, SIMDWIDTH> l = 0; l <= max_label; ++l)
+-                        iset_labels[l] = (iset_labels[l] & inc_o_n[l]);
++                        if(i == 0)
++                        {
++                            count[l] = 1;
++                            candidates.push_back(l);
++                        }
++                        else if(count[l] == i)
++                        {
++                            count[l] = i + 1;
++                        }
++                    }
+                 }
+ 
+-                /* create label set from incidence vector */
+-                for(_iv_st<COSTTYPE, SIMDWIDTH> l = 0; l <= max_label; ++l)
+-                    if(iset_labels[l])
++                /* in order of the label, as before */
++                std::sort(candidates.begin(), candidates.end());
++                for(const _iv_st<COSTTYPE, SIMDWIDTH> l : candidates)
++                    if(count[l] == s_num_nodes)
+                         lset.push_back(l);
+ 
+                 /* replace projected label for supernode by its index */

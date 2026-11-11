@@ -3,6 +3,9 @@ externalproject_add(ext_mapmap
     GIT_REPOSITORY  https://github.com/dthuerck/mapmap_cpu.git
     GIT_TAG         fa526e0
     UPDATE_COMMAND  ""
+    # [PATCH9] patches/mapmap-patch9.patch: the multilevel step without the copy per supernode (hours on large meshes) and
+    # with a time line per level; the result is unchanged. Applied once (skipped when already applied).
+    PATCH_COMMAND   sh -c "git apply --reverse --check '${CMAKE_CURRENT_SOURCE_DIR}/../patches/mapmap-patch9.patch' 2>/dev/null || git apply '${CMAKE_CURRENT_SOURCE_DIR}/../patches/mapmap-patch9.patch'"
     SOURCE_DIR      ${CMAKE_SOURCE_DIR}/elibs/mapmap
     CONFIGURE_COMMAND ""
     BUILD_COMMAND   ""
