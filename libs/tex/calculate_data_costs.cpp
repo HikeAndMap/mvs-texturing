@@ -943,11 +943,56 @@ read_view_surveys(std::string const & filename, std::vector<TextureView> const &
     return true;
 }
 
+/* PATCH10: the survey a face is painted from (choose_survey). */
+struct SurveyChoice {
+    int chosen;          /* the survey (rank) that paints the face; num_ranks when only reserve views see it */
+    int newest_within;   /* the newest survey with a view within survey_max_angle (the rule until 2026-11-12) */
+    int newest_any;      /* the newest survey seeing it at all */
+    int most_vertical;   /* index of the most straight-down view (reserve views not counted), -1 when none */
+};
+
+/**
+ * PATCH10: the survey a face is painted from, given the n views that see it (survey rank, reserve flag, and up = cosine
+ * of the angle between straight up and the direction to the view). The newest survey whose most straight-down view
+ * (reserve views not counted) is within the limit: the larger of settings.survey_good_angle and the most straight-down
+ * view of all surveys plus settings.survey_angle_margin, never beyond settings.survey_max_angle. When no survey is within
+ * it, the survey of the most straight-down view. Used by prioritize_surveys and, for the same choice, by wire_face_state.
+ */
+static SurveyChoice
+choose_survey(std::size_t n, int const * rank, char const * reserve, float const * up, int num_ranks,
+    Settings const & settings) {
+    SurveyChoice sc = {num_ranks, num_ranks, num_ranks, -1};
+    float const cos_max = std::cos(MATH_DEG2RAD(settings.survey_max_angle));
+    static thread_local std::vector<float> best;
+    best.assign(num_ranks, -2.0f);
+    for (std::size_t k = 0; k < n; ++k) {
+        if (reserve[k]) continue;
+        int const r = std::min(num_ranks - 1, rank[k]);
+        sc.newest_any = std::min(sc.newest_any, r);
+        if (up[k] >= cos_max) sc.newest_within = std::min(sc.newest_within, r);
+        best[r] = std::max(best[r], up[k]);
+        if (sc.most_vertical < 0 || up[k] > up[sc.most_vertical]) sc.most_vertical = static_cast<int>(k);
+    }
+    if (sc.most_vertical < 0) return sc;
+    float const best_angle = std::acos(std::max(-1.0f, std::min(1.0f, up[sc.most_vertical]))) / MATH_DEG2RAD(1.0f);
+    float const limit = std::min(settings.survey_max_angle,
+        std::max(settings.survey_good_angle, best_angle + settings.survey_angle_margin));
+    float const cos_limit = std::cos(MATH_DEG2RAD(limit));
+    for (int r = 0; r < num_ranks; ++r) {
+        if (best[r] >= cos_limit) {
+            sc.chosen = r;
+            break;
+        }
+    }
+    if (sc.chosen == num_ranks) sc.chosen = std::min(num_ranks - 1, rank[sc.most_vertical]);
+    return sc;
+}
+
 /**
  * PATCH8: whether a face (corners a, b, c) has a wire under it in every view checked there. The views checked there are
  * those with a mask on every tile under the face's bounding box (they see those tiles whole within 25 deg of straight
- * down); with several surveys (vs not null), only those of the newest survey among them, not counting reserve views,
- * since prioritize_surveys paints the face from that survey. 0 when no view was checked there, or one is clean.
+ * down); with several surveys (vs not null), only those of the survey choose_survey picks among them (reserve views not
+ * counted), since prioritize_surveys paints the face from that survey. 0 when no view was checked there, or one is clean.
  *
  * With block > 0 (cells per side of a block, about the smallest face split_wire_faces makes) it also tells whether cutting
  * the face smaller can help: 1 when it can, 2 when it cannot. Uncut, the face is painted from the view with the fewest
@@ -957,8 +1002,9 @@ read_view_surveys(std::string const & filename, std::vector<TextureView> const &
  * height), so the face is left whole. With block 0: 1 for a wire in every view.
  */
 static int
-wire_face_state(GroundMasks const & g, ViewSurveys const * vs, math::Vec3f const & a, math::Vec3f const & b,
-    math::Vec3f const & c, int block = 0, int min_gain = 1) {
+wire_face_state(GroundMasks const & g, ViewSurveys const * vs, std::vector<TextureView> const & views,
+    Settings const & settings, math::Vec3f const & a, math::Vec3f const & b, math::Vec3f const & c, int block = 0,
+    int min_gain = 1) {
     double const xmin = std::min(a[0], std::min(b[0], c[0]));
     double const xmax = std::max(a[0], std::max(b[0], c[0]));
     double const ymin = std::min(a[1], std::min(b[1], c[1]));
@@ -1000,12 +1046,25 @@ wire_face_state(GroundMasks const & g, ViewSurveys const * vs, math::Vec3f const
     }
     if (checked.empty()) return false;
 
+    /* PATCH10: the survey prioritize_surveys paints the face from, chosen the same way among these views */
     int newest = -1;
+    int const num_ranks = vs != nullptr ? static_cast<int>(vs->label.size()) : 0;
     if (vs != nullptr) {
+        static thread_local std::vector<int> rk;
+        static thread_local std::vector<char> rs;
+        static thread_local std::vector<float> up;
+        rk.resize(checked.size());
+        rs.resize(checked.size());
+        up.resize(checked.size());
+        math::Vec3f const centre = (a + b + c) / 3.0f;
         for (std::size_t i = 0; i < checked.size(); ++i) {
             int const v = checked[i].view;
-            if (!vs->reserve[v] && (newest < 0 || vs->rank[v] < newest)) newest = vs->rank[v];
+            rk[i] = vs->rank[v];
+            rs[i] = vs->reserve[v];
+            up[i] = (views[v].get_pos() - centre).normalized()[2];
         }
+        SurveyChoice const sc = choose_survey(checked.size(), rk.data(), rs.data(), up.data(), num_ranks, settings);
+        if (sc.most_vertical >= 0) newest = sc.chosen;
     }
     /* (a view with a mask on the tiles may still not have checked every cell under the face; it then counts neither way) */
 
@@ -1023,7 +1082,7 @@ wire_face_state(GroundMasks const & g, ViewSurveys const * vs, math::Vec3f const
     bool any_wire = false;
     for (std::size_t i = 0; i < checked.size(); ++i) {
         int const v = checked[i].view;
-        if (newest >= 0 && (vs->rank[v] != newest || vs->reserve[v])) continue;
+        if (newest >= 0 && (std::min(num_ranks - 1, vs->rank[v]) != newest || vs->reserve[v])) continue;
         bool wire = false, unchecked = false;
         if (block > 0) std::fill(view_blocks.begin(), view_blocks.end(), 0);
         for (long gy = gy0; gy <= gy1 && !unchecked; ++gy) {
@@ -1121,10 +1180,10 @@ split_wire_faces(mve::TriangleMesh::Ptr mesh, std::vector<TextureView> const & t
             math::Vec3f const & c = verts[faces[f * 3 + 2]];
             float const longest = std::max((a - b).norm(), std::max((b - c).norm(), (c - a).norm()));
             if (longest <= min_edge) {
-                state[f] = wire_face_state(g, surveys ? &vs : nullptr, a, b, c) != 0 ? 3 : 0;
+                state[f] = wire_face_state(g, surveys ? &vs : nullptr, texture_views, settings, a, b, c) != 0 ? 3 : 0;
                 continue;
             }
-            int const st = wire_face_state(g, surveys ? &vs : nullptr, a, b, c, block, min_gain);
+            int const st = wire_face_state(g, surveys ? &vs : nullptr, texture_views, settings, a, b, c, block, min_gain);
             state[f] = static_cast<char>(st);
             if (st == 1) {
                 red[f] = 1;
@@ -1274,9 +1333,11 @@ split_wire_faces(mve::TriangleMesh::Ptr mesh, std::vector<TextureView> const & t
 
 /**
  * PATCH10: with photos of several surveys (months), each face is painted from one survey only, so that a building is never
- * painted half from one year and half from another. The survey is the newest whose views (not counting reserve views) see
- * the face within survey_max_angle of straight down; near the edge of a newer survey, where none of its views does, the
- * survey of the most straight-down view takes over. Only that survey's views stay candidates. When every view of that
+ * painted half from one year and half from another. The survey is the newest whose most straight-down view (not counting
+ * reserve views) is within max(survey_good_angle, the most straight-down view of any survey + survey_angle_margin) and
+ * survey_max_angle (choose_survey): inside a newer survey's area it paints; at its edge, where it sees the face only at a
+ * slant, an older survey that sees it clearly straighter down takes over, and where no survey is within the limit the
+ * survey of the most straight-down view does. Only that survey's views stay candidates. When every view of that
  * survey has a vehicle or a person on the face (PATCH7 boxes), the newest other survey with a clean view within the angle
  * paints it instead (reserve views included: the ground under a parked car is better than the car). Reserve views (older
  * photos inside a newer survey) otherwise paint nothing; they keep their GCP squares through force_views, which runs
@@ -1298,12 +1359,12 @@ prioritize_surveys(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> co
     bool const have_boxes = !boxes.empty();
 
     std::vector<long long> by_rank(num_ranks, 0);
-    long long edge_older = 0, vehicle_older = 0, reserve_only = 0, restricted = 0;
+    long long edge_older = 0, slanted_older = 0, vehicle_older = 0, reserve_only = 0, restricted = 0;
 
     #pragma omp parallel
     {
         std::vector<long long> local_by_rank(num_ranks, 0);
-        long long local_edge = 0, local_vehicle = 0, local_reserve_only = 0, local_restricted = 0;
+        long long local_edge = 0, local_slanted = 0, local_vehicle = 0, local_reserve_only = 0, local_restricted = 0;
 
         #pragma omp for schedule(dynamic, 1024)
         for (std::int64_t f = 0; f < num_faces; ++f) {
@@ -1324,29 +1385,24 @@ prioritize_surveys(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> co
             std::vector<int> rank(n);
             std::vector<char> reserve(n), within(n);
             std::vector<float> up(n);
-            int newest_seen = num_ranks;    /* newest survey seeing the face within the angle (reserve views not counted) */
-            int newest_any = num_ranks;     /* newest survey seeing it at all (reserve views not counted) */
-            int most_vertical = -1;         /* the non-reserve view looking most straight down at it */
             for (std::size_t k = 0; k < n; ++k) {
                 int const view = static_cast<int>(infos[k].view_id);
                 rank[k] = std::min(num_ranks - 1, vs.rank[view]);
                 reserve[k] = vs.reserve[view];
                 up[k] = (texture_views[view].get_pos() - center).normalized()[2];
                 within[k] = up[k] >= cos_max ? 1 : 0;
-                if (reserve[k]) continue;
-                newest_any = std::min(newest_any, rank[k]);
-                if (within[k]) newest_seen = std::min(newest_seen, rank[k]);
-                if (most_vertical < 0 || up[k] > up[most_vertical]) most_vertical = static_cast<int>(k);
             }
-            if (most_vertical < 0) {
+            SurveyChoice const sc = choose_survey(n, rank.data(), reserve.data(), up.data(), num_ranks, settings);
+            if (sc.most_vertical < 0) {
                 local_reserve_only += 1;
                 continue;
             }
 
-            int chosen = newest_seen;
-            if (chosen == num_ranks) {
-                chosen = rank[most_vertical];
-                if (chosen > newest_any) local_edge += 1;
+            int chosen = sc.chosen;
+            if (sc.newest_within == num_ranks) {
+                if (chosen > sc.newest_any) local_edge += 1;
+            } else if (chosen > sc.newest_within) {
+                local_slanted += 1;
             }
 
             std::vector<char> keep(n, 0);
@@ -1401,6 +1457,7 @@ prioritize_surveys(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> co
         {
             for (int r = 0; r < num_ranks; ++r) by_rank[r] += local_by_rank[r];
             edge_older += local_edge;
+            slanted_older += local_slanted;
             vehicle_older += local_vehicle;
             reserve_only += local_reserve_only;
             restricted += local_restricted;
@@ -1413,7 +1470,10 @@ prioritize_surveys(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> co
     std::cout << std::endl;
     std::cout << "\t[PATCH10] " << restricted << " faces painted from one survey only; " << edge_older
         << " near the edge of a newer survey painted from an older one (no newer view within " << settings.survey_max_angle
-        << " deg); " << vehicle_older << " under a vehicle or person painted from an older survey; " << reserve_only
+        << " deg); " << slanted_older << " that a newer survey sees only at a slant painted from an older one that sees "
+        << "them straighter down (limit: the larger of " << settings.survey_good_angle << " deg and the straightest view + "
+        << settings.survey_angle_margin << " deg); " << vehicle_older << " under a vehicle or person painted from an older survey; "
+        << reserve_only
         << " seen only by reserve views, left as they are" << std::endl;
 }
 

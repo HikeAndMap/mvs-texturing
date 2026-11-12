@@ -116,8 +116,9 @@ Arguments parse_args(int argc, char **argv) {
         "clean or its longest edge is at most this many metres; 0 = no splitting [0.12]");
     args.add_option('\0', VIEW_SURVEYS, true,
         "File with the survey of every view, one per line: image_name rank reserve (rank 0 = the newest survey; reserve 1 = "
-        "an older photo inside a newer survey). A face is painted from the newest survey that sees it within the survey "
-        "angle; a reserve view only paints GCP squares and the ground under vehicles");
+        "an older photo inside a newer survey). A face is painted from the newest survey whose straightest view is within "
+        "10 deg, or within 5 deg of the straightest view of any survey (never beyond the survey angle); a reserve view "
+        "only paints GCP squares and the ground under vehicles");
     args.add_option('\0', SURVEY_MAX_ANGLE, true,
         "Angle from straight down within which a survey's view counts as seeing a face [25]");
     args.add_option('\0', WRITE_LABELING, false,

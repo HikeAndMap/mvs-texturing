@@ -121,6 +121,14 @@ struct Settings {
 
     /* PATCH10: a survey paints a face when one of its views sees the face within this angle from straight down. */
     float survey_max_angle = 25.0f;
+
+    /* PATCH10: a newer survey paints a face only when its most straight-down view is within the larger of these two:
+     * survey_good_angle, or survey_angle_margin more than the most straight-down view of any survey (never beyond
+     * survey_max_angle). Inside a survey's own area its best view is a few degrees off straight down, so it keeps that
+     * area; at its edge, where it sees the face only at a slant, an older survey that sees it clearly straighter down
+     * paints it instead (a slanted view lays roof edges onto the ground beside them). Not texrecon options. */
+    float survey_good_angle = 10.0f;
+    float survey_angle_margin = 5.0f;
 };
 
 TEX_NAMESPACE_END
