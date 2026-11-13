@@ -507,11 +507,11 @@ struct MaskedBox {
  * of every view (same index as texture_views).
  */
 std::vector<std::vector<MaskedBox> >
-read_masked_boxes(std::string const & filename, std::vector<TextureView> const & texture_views) {
+read_masked_boxes(std::string const & filename, std::vector<TextureView> const & texture_views, bool quiet = false) {
     std::vector<std::vector<MaskedBox> > boxes(texture_views.size());
     std::ifstream in(filename.c_str());
     if (!in.good()) {
-        std::cout << "\t[PATCH7] Cannot read the masked boxes file " << filename << std::endl;
+        if (!quiet) std::cout << "\t[PATCH7] Cannot read the masked boxes file " << filename << std::endl;
         return boxes;
     }
 
@@ -533,7 +533,7 @@ read_masked_boxes(std::string const & filename, std::vector<TextureView> const &
         std::string name;
         MaskedBox box;
         if (!(fields >> name >> box.x0 >> box.y0 >> box.x1 >> box.y1)) {
-            std::cout << "\t[PATCH7] Ignoring malformed line: " << line << std::endl;
+            if (!quiet) std::cout << "\t[PATCH7] Ignoring malformed line: " << line << std::endl;
             continue;
         }
         if (name != last_name) {
@@ -560,6 +560,7 @@ read_masked_boxes(std::string const & filename, std::vector<TextureView> const &
         num_boxes += 1;
     }
 
+    if (quiet) return boxes;
     std::size_t num_views = 0;
     for (std::size_t j = 0; j < boxes.size(); ++j)
         if (!boxes[j].empty()) num_views += 1;
@@ -991,8 +992,14 @@ choose_survey(std::size_t n, int const * rank, char const * reserve, float const
 /**
  * PATCH8: whether a face (corners a, b, c) has a wire under it in every view checked there. The views checked there are
  * those with a mask on every tile under the face's bounding box (they see those tiles whole within 25 deg of straight
- * down); with several surveys (vs not null), only those of the survey choose_survey picks among them (reserve views not
- * counted), since prioritize_surveys paints the face from that survey. 0 when no view was checked there, or one is clean.
+ * down); of those, only the views the face will be painted from count: with several surveys (vs not null) those of the
+ * survey choose_survey picks among them (reserve views not counted), since prioritize_surveys paints the face from that
+ * survey; with vehicle boxes (boxes not null, PATCH7) only the views without a vehicle or person on the face, when there
+ * is one, since mask_views leaves the others out (and when every view of that survey has one, the views of the older
+ * survey prioritize_surveys falls back to). Counting a view with a truck on the face as clean left the face whole, and
+ * mask_views then dropped that view: the views left all had a wire, and a piece of wire came back in the orthophoto
+ * wherever a vehicle stood (the NL roof test, a road with a truck in the photos of one flight). 0 when no view was
+ * checked there, or one is clean.
  *
  * With block > 0 (cells per side of a block, about the smallest face split_wire_faces makes) it also tells whether cutting
  * the face smaller can help: 1 when it can, 2 when it cannot. Uncut, the face is painted from the view with the fewest
@@ -1002,9 +1009,9 @@ choose_survey(std::size_t n, int const * rank, char const * reserve, float const
  * height), so the face is left whole. With block 0: 1 for a wire in every view.
  */
 static int
-wire_face_state(GroundMasks const & g, ViewSurveys const * vs, std::vector<TextureView> const & views,
-    Settings const & settings, math::Vec3f const & a, math::Vec3f const & b, math::Vec3f const & c, int block = 0,
-    int min_gain = 1) {
+wire_face_state(GroundMasks const & g, ViewSurveys const * vs, std::vector<std::vector<MaskedBox> > const * boxes,
+    std::vector<TextureView> const & views, Settings const & settings, math::Vec3f const & a, math::Vec3f const & b,
+    math::Vec3f const & c, int block = 0, int min_gain = 1) {
     double const xmin = std::min(a[0], std::min(b[0], c[0]));
     double const xmax = std::max(a[0], std::max(b[0], c[0]));
     double const ymin = std::min(a[1], std::min(b[1], c[1]));
@@ -1046,25 +1053,68 @@ wire_face_state(GroundMasks const & g, ViewSurveys const * vs, std::vector<Textu
     }
     if (checked.empty()) return false;
 
-    /* PATCH10: the survey prioritize_surveys paints the face from, chosen the same way among these views */
-    int newest = -1;
-    int const num_ranks = vs != nullptr ? static_cast<int>(vs->label.size()) : 0;
+    /* PATCH7: the views with a vehicle or person on the face */
+    std::size_t const nc = checked.size();
+    static thread_local std::vector<char> boxed, use;
+    boxed.assign(nc, 0);
+    use.assign(nc, 1);
+    bool const have_boxes = boxes != nullptr && !boxes->empty();
+    if (have_boxes) {
+        for (std::size_t i = 0; i < nc; ++i) {
+            int const v = checked[i].view;
+            boxed[i] = face_touches_box(views[v], (*boxes)[v], a, b, c) ? 1 : 0;
+        }
+    }
+
+    /* PATCH10: the survey prioritize_surveys paints the face from, chosen the same way among these views, and its vehicle
+     * fallback to an older survey */
     if (vs != nullptr) {
+        int const num_ranks = static_cast<int>(vs->label.size());
+        float const cos_max = std::cos(MATH_DEG2RAD(settings.survey_max_angle));
         static thread_local std::vector<int> rk;
         static thread_local std::vector<char> rs;
         static thread_local std::vector<float> up;
-        rk.resize(checked.size());
-        rs.resize(checked.size());
-        up.resize(checked.size());
+        rk.resize(nc);
+        rs.resize(nc);
+        up.resize(nc);
         math::Vec3f const centre = (a + b + c) / 3.0f;
-        for (std::size_t i = 0; i < checked.size(); ++i) {
+        for (std::size_t i = 0; i < nc; ++i) {
             int const v = checked[i].view;
-            rk[i] = vs->rank[v];
+            rk[i] = std::min(num_ranks - 1, vs->rank[v]);
             rs[i] = vs->reserve[v];
             up[i] = (views[v].get_pos() - centre).normalized()[2];
         }
-        SurveyChoice const sc = choose_survey(checked.size(), rk.data(), rs.data(), up.data(), num_ranks, settings);
-        if (sc.most_vertical >= 0) newest = sc.chosen;
+        SurveyChoice const sc = choose_survey(nc, rk.data(), rs.data(), up.data(), num_ranks, settings);
+        if (sc.most_vertical >= 0) {
+            int const chosen = sc.chosen;
+            bool fallback = false;
+            if (have_boxes) {
+                bool chosen_clean = false;
+                for (std::size_t i = 0; i < nc; ++i)
+                    if (rk[i] == chosen && !rs[i] && !boxed[i]) chosen_clean = true;
+                if (!chosen_clean) {
+                    int other = num_ranks;
+                    for (std::size_t i = 0; i < nc; ++i)
+                        if (rk[i] != chosen && up[i] >= cos_max && !boxed[i]) other = std::min(other, rk[i]);
+                    if (other < num_ranks) {
+                        for (std::size_t i = 0; i < nc; ++i)
+                            use[i] = (rk[i] == other && up[i] >= cos_max && !boxed[i]) ? 1 : 0;
+                        fallback = true;
+                    }
+                }
+            }
+            if (!fallback)
+                for (std::size_t i = 0; i < nc; ++i) use[i] = (rk[i] == chosen && !rs[i]) ? 1 : 0;
+        }
+    }
+    /* PATCH7: of those, mask_views leaves out the views with a box on the face, as long as one without is left */
+    if (have_boxes) {
+        bool any_free = false;
+        for (std::size_t i = 0; i < nc; ++i)
+            if (use[i] && !boxed[i]) any_free = true;
+        if (any_free)
+            for (std::size_t i = 0; i < nc; ++i)
+                if (boxed[i]) use[i] = 0;
     }
     /* (a view with a mask on the tiles may still not have checked every cell under the face; it then counts neither way) */
 
@@ -1081,8 +1131,7 @@ wire_face_state(GroundMasks const & g, ViewSurveys const * vs, std::vector<Textu
 
     bool any_wire = false;
     for (std::size_t i = 0; i < checked.size(); ++i) {
-        int const v = checked[i].view;
-        if (newest >= 0 && (std::min(num_ranks - 1, vs->rank[v]) != newest || vs->reserve[v])) continue;
+        if (!use[i]) continue;
         bool wire = false, unchecked = false;
         if (block > 0) std::fill(view_blocks.begin(), view_blocks.end(), 0);
         for (long gy = gy0; gy <= gy1 && !unchecked; ++gy) {
@@ -1130,7 +1179,8 @@ wire_face_state(GroundMasks const & g, ViewSurveys const * vs, std::vector<Textu
  * clean view or its longest edge is at most settings.wire_split_min_edge. The new vertices lie on the old edges, so the
  * surface does not change; their colours and other values are the mean of the edge's ends, the normals are recomputed.
  * A face is cut only where a smaller piece can find a clean view (wire_face_state): where the same spot is marked in every
- * view, cutting never finds one, and over New Lucban cutting those as well made 1.9 million faces into 46 million.
+ * view, cutting never finds one, and over New Lucban cutting those as well made 1.9 million faces into 46 million. Only
+ * the views the face will be painted from count (its survey, PATCH10, and the views without a vehicle on it, PATCH7).
  */
 void
 split_wire_faces(mve::TriangleMesh::Ptr mesh, std::vector<TextureView> const & texture_views, Settings const & settings) {
@@ -1140,6 +1190,10 @@ split_wire_faces(mve::TriangleMesh::Ptr mesh, std::vector<TextureView> const & t
     ViewSurveys vs;
     bool const surveys = !settings.view_surveys_file.empty()
         && read_view_surveys(settings.view_surveys_file, texture_views, &vs, true);
+    std::vector<std::vector<MaskedBox> > boxes;
+    if (!settings.masked_boxes_file.empty())
+        boxes = read_masked_boxes(settings.masked_boxes_file, texture_views, true);
+    std::vector<std::vector<MaskedBox> > const * const boxes_ptr = boxes.empty() ? nullptr : &boxes;
 
     std::vector<unsigned int> & faces = mesh->get_faces();
     std::vector<math::Vec3f> & verts = mesh->get_vertices();
@@ -1180,10 +1234,11 @@ split_wire_faces(mve::TriangleMesh::Ptr mesh, std::vector<TextureView> const & t
             math::Vec3f const & c = verts[faces[f * 3 + 2]];
             float const longest = std::max((a - b).norm(), std::max((b - c).norm(), (c - a).norm()));
             if (longest <= min_edge) {
-                state[f] = wire_face_state(g, surveys ? &vs : nullptr, texture_views, settings, a, b, c) != 0 ? 3 : 0;
+                state[f] = wire_face_state(g, surveys ? &vs : nullptr, boxes_ptr, texture_views, settings, a, b, c) != 0 ? 3 : 0;
                 continue;
             }
-            int const st = wire_face_state(g, surveys ? &vs : nullptr, texture_views, settings, a, b, c, block, min_gain);
+            int const st = wire_face_state(g, surveys ? &vs : nullptr, boxes_ptr, texture_views, settings, a, b, c, block,
+                min_gain);
             state[f] = static_cast<char>(st);
             if (st == 1) {
                 red[f] = 1;
@@ -1477,6 +1532,61 @@ prioritize_surveys(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> co
         << " seen only by reserve views, left as they are" << std::endl;
 }
 
+/**
+ * PATCH11: in the 2.5D mesh (nadir mode) every wall is a steep slope from the roof edge down to the ground, often wider
+ * than the wall since the mesh is smoothed. A slanted view paints that slope with the wall's face, or with the roof
+ * edge shifted outward (a dark band, a roof edge moved onto the road); a view from nearly straight above sees what lies
+ * above every point of the slope: the roof where the roof is, the ground where the ground is, which is what an orthophoto
+ * shows. So a face more than settings.steep_face_angle from level keeps only its views within settings.steep_view_margin
+ * of its most straight-down view (the angle between straight up and the direction from the face to the view). Runs last,
+ * on the views PATCH10, PATCH7 and PATCH8 left. Not in the 3D model (no nadir mode), where a wall is painted face on.
+ */
+void
+steep_faces(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> const & texture_views, Settings const & settings,
+    FaceProjectionInfos * face_projection_infos) {
+    std::vector<unsigned int> const & faces = mesh->get_faces();
+    std::vector<math::Vec3f> const & vertices = mesh->get_vertices();
+    std::int64_t const num_faces = static_cast<std::int64_t>(face_projection_infos->size());
+    float const cos_steep = std::cos(MATH_DEG2RAD(settings.steep_face_angle));
+    float const margin = MATH_DEG2RAD(settings.steep_view_margin);
+
+    long long steep = 0, restricted = 0, views_dropped = 0;
+
+    #pragma omp parallel for schedule(dynamic, 1024) reduction(+:steep,restricted,views_dropped)
+    for (std::int64_t f = 0; f < num_faces; ++f) {
+        math::Vec3f const & v1 = vertices[faces[f * 3]];
+        math::Vec3f const & v2 = vertices[faces[f * 3 + 1]];
+        math::Vec3f const & v3 = vertices[faces[f * 3 + 2]];
+        math::Vec3f const normal = (v2 - v1).cross(v3 - v1);
+        float const len = normal.norm();
+        if (len <= 0.0f || std::abs(normal[2]) / len >= cos_steep) continue;
+        steep += 1;
+
+        std::vector<FaceProjectionInfo> & infos = face_projection_infos->at(f);
+        if (infos.size() < 2) continue;
+        math::Vec3f const centre = (v1 + v2 + v3) / 3.0f;
+        std::vector<float> angle(infos.size());
+        float best = 4.0f;
+        for (std::size_t k = 0; k < infos.size(); ++k) {
+            float const up = (texture_views[infos[k].view_id].get_pos() - centre).normalized()[2];
+            angle[k] = std::acos(std::max(-1.0f, std::min(1.0f, up)));
+            best = std::min(best, angle[k]);
+        }
+        std::vector<FaceProjectionInfo> kept;
+        kept.reserve(infos.size());
+        for (std::size_t k = 0; k < infos.size(); ++k)
+            if (angle[k] <= best + margin) kept.push_back(infos[k]);
+        if (kept.size() == infos.size()) continue;
+        views_dropped += static_cast<long long>(infos.size() - kept.size());
+        infos.swap(kept);
+        restricted += 1;
+    }
+
+    std::cout << "\t[PATCH11] " << steep << " steep faces (more than " << settings.steep_face_angle << " deg from level); "
+        << restricted << " of them painted only from the views within " << settings.steep_view_margin
+        << " deg of their most straight-down view (" << views_dropped << " views left out)" << std::endl;
+}
+
 void
 calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> * texture_views,
     Settings const & settings, DataCosts * data_costs) {
@@ -1512,6 +1622,10 @@ calculate_data_costs(mve::TriangleMesh::ConstPtr mesh, std::vector<TextureView> 
     if (!settings.masked_ground_file.empty()) {
         mask_ground(mesh, *texture_views, settings.masked_ground_file, &face_projection_infos);
         step_timer.step("[PATCH8] overhead wires");
+    }
+    if (settings.nadir_mode && settings.steep_face_angle > 0.0f) {
+        steep_faces(mesh, *texture_views, settings, &face_projection_infos);
+        step_timer.step("[PATCH11] steep faces");
     }
     postprocess_face_infos(settings, &face_projection_infos, data_costs);
 }

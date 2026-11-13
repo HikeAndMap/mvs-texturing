@@ -129,6 +129,12 @@ struct Settings {
      * paints it instead (a slanted view lays roof edges onto the ground beside them). Not texrecon options. */
     float survey_good_angle = 10.0f;
     float survey_angle_margin = 5.0f;
+
+    /* PATCH11: in nadir mode (the 2.5D mesh of the orthophoto) a face more than steep_face_angle from level (a wall the
+     * mesh made a slope) is painted only from its views within steep_view_margin of its most straight-down view. 0: off.
+     * Not texrecon options. */
+    float steep_face_angle = 45.0f;
+    float steep_view_margin = 3.0f;
 };
 
 TEX_NAMESPACE_END
